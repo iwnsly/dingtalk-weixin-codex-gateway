@@ -134,10 +134,44 @@ async def ask_backend(session_id: str, prompt: str, platform: str = "dingtalk") 
 
 class WorkBotHandler(dingtalk_stream.ChatbotHandler):
     async def process(self, callback: dingtalk_stream.CallbackMessage):
+        # Keep the raw callback available because the SDK only models text,
+        # picture and rich-text messages; newer media types remain in the raw dict.
+        raw = callback.data if isinstance(callback.data, dict) else {}
         message = dingtalk_stream.ChatbotMessage.from_dict(callback.data)
         sender_id = str(getattr(message, "sender_staff_id", "") or getattr(message, "sender_id", ""))
         session_id = str(getattr(message, "conversation_id", "") or sender_id)
-        text = message.text.content.strip()
+        message_type = str(raw.get("msgtype") or getattr(message, "message_type", "") or "")
+        text = ""
+        if getattr(message, "text", None) and getattr(message.text, "content", None):
+            text = message.text.content.strip()
+        elif message_type == "richText" and getattr(message, "rich_text_content", None):
+            text = "".join(
+                item.get("text", "")
+                for item in (message.rich_text_content.rich_text_list or [])
+                if isinstance(item, dict)
+            ).strip()
+
+        # DingTalk may provide a server-side transcript for audio messages.
+        if message_type in {"audio", "voice"} and not text:
+            content = raw.get("content") or raw.get("audio") or raw.get("voice") or {}
+            if isinstance(content, dict):
+                text = str(content.get("recognition") or content.get("text") or content.get("transcript") or "").strip()
+            if text:
+                LOGGER.info("Received DingTalk voice message with transcript")
+            else:
+                LOGGER.info("Received DingTalk voice message without transcript")
+                self.reply_text("已收到语音，但钉钉没有提供可用的转写文本，暂时无法识别。请改发文字。", message)
+                return AckMessage.STATUS_OK, "OK"
+
+        if message_type in {"picture", "image"} and not text:
+            LOGGER.info("Received DingTalk image message (download code present=%s)", bool((raw.get("content") or {}).get("downloadCode")))
+            self.reply_text("已收到图片。目前此版本可以接收图片通知，但尚未接入图片下载和视觉识别，请改发文字描述。", message)
+            return AckMessage.STATUS_OK, "OK"
+
+        if message_type in {"file", "document", "video"} and not text:
+            LOGGER.info("Received unsupported DingTalk media message: %s", message_type)
+            self.reply_text("已收到文件/媒体消息。目前此版本尚未接入钉钉媒体下载与解析，请改发文字说明。", message)
+            return AckMessage.STATUS_OK, "OK"
 
         if ALLOWED_USERS and sender_id not in ALLOWED_USERS:
             LOGGER.warning("Rejected sender: %s", sender_id)

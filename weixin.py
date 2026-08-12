@@ -110,12 +110,45 @@ async def main():
                 if messages: LOG.info('Received %d WeChat update(s)', len(messages))
                 for msg in messages:
                     if msg.get('message_type')!=1: continue
-                    items=msg.get('item_list') or []; text=''.join((x.get('text_item') or {}).get('text','') for x in items if x.get('type')==1).strip()
+                    items = msg.get('item_list') or []
+                    text_parts = []
+                    has_voice = False
+                    has_untranscribed_voice = False
+                    media_types = set()
+                    for item in items:
+                        item_type = item.get('type')
+                        if item_type == 1:
+                            value = (item.get('text_item') or {}).get('text', '')
+                            if value:
+                                text_parts.append(value)
+                        elif item_type == 3:
+                            has_voice = True
+                            voice_text = (item.get('voice_item') or {}).get('text', '')
+                            if voice_text:
+                                text_parts.append(voice_text)
+                            else:
+                                has_untranscribed_voice = True
+                        elif item_type in {2, 4, 5}:
+                            media_types.add({2: 'image', 4: 'file', 5: 'video'}[item_type])
+                    text = ''.join(text_parts).strip()
+                    if has_voice:
+                        LOG.info('Received WeChat voice message (transcript=%s)', bool(text))
                     if not text:
-                        LOG.info('Ignored non-text WeChat message')
+                        if has_untranscribed_voice:
+                            sid = msg.get('from_user_id') or msg.get('session_id') or 'wechat'
+                            await c.send(sid, '已收到语音，但当前微信接口未提供语音转写文本，暂时无法识别。请改发文字，或稍后重试。', msg.get('context_token',''))
+                            LOG.info('Sent WeChat voice transcription unavailable notice')
+                        else:
+                            LOG.info('Ignored unsupported non-text WeChat message')
+                        if media_types:
+                            sid = msg.get('from_user_id') or msg.get('session_id') or 'wechat'
+                            labels = {'image': '图片', 'file': '文件', 'video': '视频'}
+                            kinds = '、'.join(labels[k] for k in sorted(media_types))
+                            await c.send(sid, f'已收到{kinds}消息。目前此版本支持文本和语音转写，暂未接入媒体下载、解析和回传。请改发文字说明。', msg.get('context_token',''))
+                            LOG.info('Sent WeChat media capability notice: %s', ','.join(sorted(media_types)))
                         continue
                     sid=msg.get('from_user_id') or msg.get('session_id') or 'wechat'
-                    LOG.info('Forwarding WeChat text message to local Codex')
+                    LOG.info('Forwarding WeChat message to local Codex')
                     record(f'wechat:{sid}', 'user', text)
                     async with aiohttp.ClientSession() as s:
                         async with s.post(CODEX_URL,headers={'Authorization':f'Bearer {CODEX_TOKEN}'},json={'session_id':f'wechat:{sid}','prompt':text}) as r:
