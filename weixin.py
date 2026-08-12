@@ -20,7 +20,7 @@ LOG = logging.getLogger('dingtalk-codex-bot.weixin')
 DB = DATA / 'bot.db'
 CODEX_CWD = Path(os.getenv('CODEX_CWD', str(Path.cwd()))).resolve()
 FILES_DIR = DATA / 'wechat_files'
-MAX_FILE_BYTES = 10 * 1024 * 1024
+MAX_FILE_BYTES = 50 * 1024 * 1024
 
 def record(session_id: str, role: str, content: str) -> None:
     conn = sqlite3.connect(DB)
@@ -110,12 +110,12 @@ class WeixinClient:
         async with self.s.get(f'https://novac2c.cdn.weixin.qq.com/c2c/download?encrypted_query_param={quote(query, safe="")}') as r:
             if r.status >= 400: raise RuntimeError(f'微信文件下载失败 HTTP {r.status}')
             encrypted = await r.read()
-        if len(encrypted) > MAX_FILE_BYTES * 2: raise RuntimeError('文件超过 10 MB 限制')
+        if len(encrypted) > MAX_FILE_BYTES * 2: raise RuntimeError('文件超过 50 MB 限制')
         target.write_bytes(self._decrypt(encrypted, aes_key))
 
     async def send_file(self, to, path, context=''):
         data = path.read_bytes()
-        if len(data) > MAX_FILE_BYTES: raise RuntimeError('文件超过 10 MB 限制')
+        if len(data) > MAX_FILE_BYTES: raise RuntimeError('文件超过 50 MB 限制')
         key_hex, encoded_key, encrypted, md5 = self._encrypt(data)
         filekey = os.urandom(16).hex()
         upload = await self._post_json('ilink/bot/getuploadurl', {'filekey': filekey, 'media_type': 3, 'to_user_id': to, 'rawsize': len(data), 'rawfilemd5': md5, 'filesize': len(encrypted), 'no_need_thumb': True, 'aeskey': key_hex})
