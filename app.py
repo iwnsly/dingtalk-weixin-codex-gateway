@@ -4,6 +4,8 @@ import asyncio
 import logging
 import os
 import sqlite3
+import mimetypes
+import requests
 from pathlib import Path
 
 import aiohttp
@@ -36,6 +38,9 @@ REQUEST_TIMEOUT_SECONDS = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "120"))
 PROGRESS_INTERVAL_SECONDS = max(10, int(os.getenv("PROGRESS_INTERVAL_SECONDS", "30")))
 DB_PATH = Path(os.getenv("DB_PATH", "/app/data/bot.db"))
 RUNTIME_CONFIG_PATH = Path(os.getenv("RUNTIME_CONFIG_PATH", "/app/data/runtime.json"))
+CODEX_CWD_PATH = Path(os.getenv("CODEX_CWD", str(Path.cwd()))).resolve()
+MEDIA_DIR = DB_PATH.parent / "dingtalk_files"
+MAX_MEDIA_BYTES = 50 * 1024 * 1024
 
 
 def runtime_config() -> dict:
@@ -160,6 +165,37 @@ async def ask_backend(session_id: str, prompt: str, platform: str = "dingtalk") 
 
 
 class WorkBotHandler(dingtalk_stream.ChatbotHandler):
+    def _download_media(self, download_code: str, target: Path) -> None:
+        url = self.get_image_download_url(download_code)
+        if not url:
+            raise RuntimeError("钉钉未返回媒体下载地址")
+        response = requests.get(url, timeout=120)
+        response.raise_for_status()
+        if len(response.content) > MAX_MEDIA_BYTES:
+            raise RuntimeError("媒体超过 50 MB 限制")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(response.content)
+
+    def _send_media(self, message, path: Path, kind: str) -> None:
+        data = path.read_bytes()
+        if len(data) > MAX_MEDIA_BYTES:
+            raise RuntimeError("媒体超过 50 MB 限制")
+        media_id = self.dingtalk_client.upload_to_dingtalk(
+            data,
+            filetype="image" if kind == "image" else "file",
+            filename=path.name,
+            mimetype=mimetypes.guess_type(path.name)[0] or "application/octet-stream",
+        )
+        if not media_id:
+            raise RuntimeError("钉钉媒体上传失败")
+        payload = {
+            "msgtype": "image" if kind == "image" else "file",
+            "image": {"photoURL": media_id} if kind == "image" else {"media_id": media_id},
+            "at": {"atUserIds": [message.sender_staff_id]},
+        }
+        response = requests.post(message.session_webhook, json=payload, timeout=30)
+        response.raise_for_status()
+
     async def process(self, callback: dingtalk_stream.CallbackMessage):
         # Keep the raw callback available because the SDK only models text,
         # picture and rich-text messages; newer media types remain in the raw dict.
@@ -168,6 +204,9 @@ class WorkBotHandler(dingtalk_stream.ChatbotHandler):
         sender_id = str(getattr(message, "sender_staff_id", "") or getattr(message, "sender_id", ""))
         session_id = str(getattr(message, "conversation_id", "") or sender_id)
         message_type = str(raw.get("msgtype") or getattr(message, "message_type", "") or "")
+        raw_content = raw.get("content") if isinstance(raw.get("content"), dict) else {}
+        download_code = str(raw_content.get("downloadCode") or raw_content.get("download_code") or "").strip()
+        media_name = str(raw_content.get("fileName") or raw_content.get("file_name") or raw_content.get("name") or "").strip()
         text = ""
         if getattr(message, "text", None) and getattr(message.text, "content", None):
             text = message.text.content.strip()
@@ -191,13 +230,28 @@ class WorkBotHandler(dingtalk_stream.ChatbotHandler):
                 return AckMessage.STATUS_OK, "OK"
 
         if message_type in {"picture", "image"} and not text:
-            LOGGER.info("Received DingTalk image message (download code present=%s)", bool((raw.get("content") or {}).get("downloadCode")))
-            self.reply_text("已收到图片。目前此版本可以接收图片通知，但尚未接入图片下载和视觉识别，请改发文字描述。", message)
+            LOGGER.info("Received DingTalk image message (download code present=%s)", bool(download_code))
+            try:
+                sid_dir = MEDIA_DIR / __import__('hashlib').sha256(session_id.encode()).hexdigest()[:16]
+                target = sid_dir / (Path(media_name).name or "image.png")
+                await asyncio.to_thread(self._download_media, download_code, target)
+                self.reply_text(f"图片已接收并保存到本地：{target.relative_to(DB_PATH.parent.parent)}", message)
+            except Exception as exc:
+                self.reply_text(f"图片接收失败：{exc}", message)
             return AckMessage.STATUS_OK, "OK"
 
         if message_type in {"file", "document", "video"} and not text:
             LOGGER.info("Received unsupported DingTalk media message: %s", message_type)
-            self.reply_text("已收到文件/媒体消息。目前此版本尚未接入钉钉媒体下载与解析，请改发文字说明。", message)
+            if message_type in {"file", "document"} and download_code:
+                try:
+                    sid_dir = MEDIA_DIR / __import__('hashlib').sha256(session_id.encode()).hexdigest()[:16]
+                    target = sid_dir / (Path(media_name).name or "file.bin")
+                    await asyncio.to_thread(self._download_media, download_code, target)
+                    self.reply_text(f"文件已接收并保存到本地：{target.relative_to(DB_PATH.parent.parent)}", message)
+                except Exception as exc:
+                    self.reply_text(f"文件接收失败：{exc}", message)
+            else:
+                self.reply_text("已收到媒体消息，但钉钉未提供可用下载码。", message)
             return AckMessage.STATUS_OK, "OK"
 
         if ALLOWED_USERS and sender_id not in ALLOWED_USERS:
@@ -214,6 +268,21 @@ class WorkBotHandler(dingtalk_stream.ChatbotHandler):
             if not text.startswith(COMMAND_PREFIX):
                 return AckMessage.STATUS_OK, "IGNORED"
             text = text[len(COMMAND_PREFIX) :].strip()
+
+        lowered = text.strip()
+        if lowered.startswith("发送文件") or lowered.startswith("发送图片"):
+            kind = "image" if lowered.startswith("发送图片") else "file"
+            raw_path = lowered.split(":", 1)[1].strip() if ":" in lowered else lowered.split(None, 1)[1].strip() if len(lowered.split(None, 1)) > 1 else ""
+            candidate = (CODEX_CWD_PATH / raw_path).resolve() if not os.path.isabs(raw_path) else Path(raw_path).resolve()
+            try:
+                candidate.relative_to(CODEX_CWD_PATH)
+                if not candidate.is_file(): raise RuntimeError("文件不存在")
+                self.reply_text(f"正在发送媒体：{candidate.name}", message)
+                await asyncio.to_thread(self._send_media, message, candidate, kind)
+                self.reply_text(f"已发送：{candidate.name}", message)
+            except Exception as exc:
+                self.reply_text(f"发送媒体失败：{exc}", message)
+            return AckMessage.STATUS_OK, "OK"
 
         if not text:
             self.reply_text("请输入工作问题。", message)
