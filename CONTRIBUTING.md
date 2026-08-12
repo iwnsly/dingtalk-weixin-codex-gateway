@@ -1,6 +1,6 @@
 # Contributing
 
-感谢你参与改进 DingTalk Codex Bot。
+感谢你参与改进 DingTalk / Weixin Codex Gateway。
 
 ## 开发流程
 

@@ -20,6 +20,9 @@ LOGGER = logging.getLogger("dingtalk-codex-bot")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
+AI_BACKEND = os.getenv("AI_BACKEND", "openai").strip().lower()
+CODEX_BRIDGE_URL = os.getenv("CODEX_BRIDGE_URL", "http://host.docker.internal:8787/v1/chat").rstrip("/")
+CODEX_BRIDGE_TOKEN = os.getenv("CODEX_BRIDGE_TOKEN", "")
 SYSTEM_PROMPT = os.getenv(
     "SYSTEM_PROMPT",
     "You are a concise work assistant. Reply in the user's language. Do not claim to have completed actions you did not perform.",
@@ -30,6 +33,18 @@ MAX_INPUT_CHARS = int(os.getenv("MAX_INPUT_CHARS", "6000"))
 MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "12"))
 REQUEST_TIMEOUT_SECONDS = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "120"))
 DB_PATH = Path(os.getenv("DB_PATH", "/app/data/bot.db"))
+RUNTIME_CONFIG_PATH = Path(os.getenv("RUNTIME_CONFIG_PATH", "/app/data/runtime.json"))
+
+
+def runtime_config() -> dict:
+    if not RUNTIME_CONFIG_PATH.exists():
+        return {}
+    try:
+        import json
+        return json.loads(RUNTIME_CONFIG_PATH.read_text())
+    except (OSError, ValueError):
+        LOGGER.exception("Failed to read runtime config")
+        return {}
 
 
 class ConversationStore:
@@ -41,6 +56,9 @@ class ConversationStore:
             "id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, "
             "role TEXT NOT NULL, content TEXT NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)"
         )
+        columns = {row[1] for row in self.conn.execute("PRAGMA table_info(messages)")}
+        if "platform" not in columns:
+            self.conn.execute("ALTER TABLE messages ADD COLUMN platform TEXT NOT NULL DEFAULT 'dingtalk'")
         self.conn.commit()
         self.lock = asyncio.Lock()
 
@@ -52,11 +70,11 @@ class ConversationStore:
             ).fetchall()
         return [{"role": role, "content": content} for role, content in reversed(rows)]
 
-    async def append(self, session_id: str, role: str, content: str) -> None:
+    async def append(self, session_id: str, role: str, content: str, platform: str = "dingtalk") -> None:
         async with self.lock:
             self.conn.execute(
-                "INSERT INTO messages(session_id, role, content) VALUES (?, ?, ?)",
-                (session_id, role, content),
+                "INSERT INTO messages(session_id, role, content, platform) VALUES (?, ?, ?, ?)",
+                (session_id, role, content, platform),
             )
             self.conn.commit()
 
@@ -70,7 +88,7 @@ STORE = ConversationStore(DB_PATH)
 REQUEST_LOCKS: dict[str, asyncio.Lock] = {}
 
 
-async def ask_openai(session_id: str, prompt: str) -> str:
+async def ask_openai(session_id: str, prompt: str, platform: str = "dingtalk") -> str:
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY is not configured")
     history = await STORE.history(session_id)
@@ -85,9 +103,33 @@ async def ask_openai(session_id: str, prompt: str) -> str:
                 message = body.get("error", {}).get("message", str(body)) if isinstance(body, dict) else str(body)
                 raise RuntimeError(f"AI request failed ({response.status}): {message}")
     answer = body["choices"][0]["message"]["content"].strip()
-    await STORE.append(session_id, "user", prompt)
-    await STORE.append(session_id, "assistant", answer)
+    await STORE.append(session_id, "user", prompt, platform)
+    await STORE.append(session_id, "assistant", answer, platform)
     return answer
+
+
+async def ask_backend(session_id: str, prompt: str, platform: str = "dingtalk") -> str:
+    if AI_BACKEND == "codex":
+        if not CODEX_BRIDGE_TOKEN:
+            raise RuntimeError("CODEX_BRIDGE_TOKEN is not configured")
+        timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
+        headers = {"Authorization": f"Bearer {CODEX_BRIDGE_TOKEN}"}
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                CODEX_BRIDGE_URL,
+                headers=headers,
+                json={"session_id": session_id, "prompt": prompt},
+            ) as response:
+                body = await response.json(content_type=None)
+                if response.status >= 400:
+                    raise RuntimeError(body.get("error", str(body)))
+        answer = str(body.get("answer", "")).strip()
+        if not answer:
+            raise RuntimeError("本地 Codex 没有返回内容")
+        await STORE.append(session_id, "user", prompt, platform)
+        await STORE.append(session_id, "assistant", answer, platform)
+        return answer
+    return await ask_openai(session_id, prompt, platform)
 
 
 class WorkBotHandler(dingtalk_stream.ChatbotHandler):
@@ -126,29 +168,33 @@ class WorkBotHandler(dingtalk_stream.ChatbotHandler):
 
         async with lock:
             try:
-                answer = await ask_openai(session_id, text)
+                answer = await ask_backend(session_id, text, "dingtalk")
             except Exception:
                 LOGGER.exception("Failed to process message from %s", sender_id)
-                answer = "请求处理失败，请稍后再试。"
+                answer = "本地 Codex 暂时不可用，请检查 Bridge 状态和配置。" if AI_BACKEND == "codex" else "尚未配置 OPENAI_API_KEY，当前只能验证钉钉连接。"
             self.reply_text(answer[:18000], message)
         return AckMessage.STATUS_OK, "OK"
 
 
 def main() -> None:
-    if not OPENAI_API_KEY:
-        raise SystemExit("OPENAI_API_KEY is required")
-    client_id = os.environ["DINGTALK_CLIENT_ID"]
-    client_secret = os.environ["DINGTALK_CLIENT_SECRET"]
+    config = runtime_config()
+    channel = config.get("channel", "dingtalk")
+    if channel != "dingtalk":
+        LOGGER.info("DingTalk adapter disabled; selected channel is %s", channel)
+        asyncio.run(asyncio.Event().wait())
+        return
+    if AI_BACKEND != "codex" and not OPENAI_API_KEY:
+        LOGGER.warning("OPENAI_API_KEY is not configured; DingTalk connectivity will start, but AI replies are disabled")
+    dingtalk = config.get("dingtalk", {})
+    client_id = dingtalk.get("client_id") or os.environ["DINGTALK_CLIENT_ID"]
+    client_secret = dingtalk.get("client_secret") or os.environ["DINGTALK_CLIENT_SECRET"]
     credential = dingtalk_stream.Credential(client_id, client_secret)
-    client = dingtalk_stream.DingTalkStreamClient(
-        credential,
-        websocket_connect_options={"open_timeout": 15, "ping_interval": 20, "ping_timeout": 20},
-    )
+    client = dingtalk_stream.DingTalkStreamClient(credential, logger=LOGGER)
     client.register_callback_handler(
         dingtalk_stream.chatbot.ChatbotMessage.TOPIC,
         WorkBotHandler(),
     )
-    LOGGER.info("Starting DingTalk Stream bot with model %s", OPENAI_MODEL)
+    LOGGER.info("Starting DingTalk Stream bot with backend %s", AI_BACKEND)
     client.start_forever()
 
 

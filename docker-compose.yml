@@ -1,8 +1,41 @@
 services:
   bot:
     build: .
-    container_name: dingtalk-codex-bot
+    container_name: dingtalk-codex-bot-dingtalk
     restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - ./data:/app/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  wechat:
+    build: .
+    container_name: dingtalk-codex-bot-weixin
+    restart: unless-stopped
+    command: ["python", "weixin.py"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DB_PATH: /app/data/bot.db
+    volumes:
+      - ./data:/app/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  admin:
+    build: .
+    container_name: dingtalk-codex-bot-admin
+    restart: unless-stopped
+    command: ["python", "admin.py"]
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      CONFIG_PATH: /app/data/runtime.json
+      DB_PATH: /app/data/bot.db
     env_file:
       - path: .env
         required: false

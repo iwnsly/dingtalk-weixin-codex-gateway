@@ -1,186 +1,128 @@
-# DingTalk Codex Bot
+# DingTalk / Weixin Codex Gateway
 
-[![CI](https://github.com/iwnsly/dingtalk-codex-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/iwnsly/dingtalk-codex-bot/actions/workflows/ci.yml)
+一个可自部署的本地 Codex 消息网关：在钉钉和微信之间选择一个入口，把消息转发到宿主机上的 Codex CLI，并将回复发回原聊天平台。
+
+[![CI](https://github.com/iwnsly/dingtalk-weixin-codex-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/iwnsly/dingtalk-weixin-codex-gateway/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![DingTalk Stream](https://img.shields.io/badge/DingTalk-Stream-1677FF)](https://github.com/open-dingtalk/dingtalk-stream-sdk-python)
+[![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white)](https://docs.docker.com/compose/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-
-一个轻量、可自部署的钉钉 AI 工作助手。项目直接使用钉钉官方 Stream SDK 连接机器人，不需要公网回调地址，也不依赖 LangBot 等付费连接服务。
-
-> 项目名中的 Codex 表示面向工作任务的智能助手。当前版本调用 OpenAI 兼容 API，不连接或依赖 Codex 桌面客户端。
 
 ## 项目定位
 
-| 分类 | 说明 |
-| --- | --- |
-| 使用场景 | 工作问答、会议纪要整理、邮件草拟、文档总结、方案分析 |
-| 消息平台 | 钉钉企业内部应用机器人，Stream 模式双向通信 |
-| AI 接口 | OpenAI Chat Completions 兼容接口，可配置模型与网关地址 |
-| 部署方式 | Docker Compose，数据保存在本地 SQLite |
-| 安全边界 | 可配置用户白名单、命令前缀、输入长度、超时和单会话并发限制 |
-| 项目范围 | 纯文本工作助手，不提供终端执行、文件操作或系统管理能力 |
+`dingtalk-weixin-codex-gateway` 面向个人或小团队的工作场景，提供一个统一的管理界面和两种可选 IM 适配器：
 
-## 核心功能
+- **钉钉**：使用官方 DingTalk Stream SDK 和企业内部应用凭据。
+- **微信**：直接使用腾讯微信 iLink Bot API 二维码登录，不需要安装 OpenClaw CLI 或 Gateway。
+- **本地 Codex**：宿主机运行受控 Bridge，调用 Codex CLI；Bridge 默认使用只读沙箱。
+- **控制台**：配置入口、查看微信登录状态、修改管理密码和审计聊天记录。
 
-- 使用钉钉官方 `dingtalk-stream` SDK，网络异常时自动重连。
-- 支持 OpenAI 及兼容 Chat Completions API。
-- 按钉钉会话保存上下文，支持 `/reset` 或“重置会话”。
-- 使用 SQLite 持久化聊天记录，容器升级不会丢失数据。
-- 支持钉钉 Staff ID 白名单和可选命令前缀。
-- 同一会话只允许一个请求执行，避免重复消耗和回复乱序。
-- 提供 Docker Compose、环境变量示例和 GitHub Actions 检查。
+两个 IM 入口共享同一个 Codex Bridge，但运行时只启用一个渠道，避免重复消费和会话混乱。
 
-## 工作流程
+## 架构
 
 ```text
-钉钉用户
-   │
-   ▼
-钉钉 Stream 长连接
-   │
-   ▼
-DingTalk Codex Bot
-   ├── 用户白名单 / 前缀检查
-   ├── SQLite 会话上下文
-   └── 并发、长度与超时限制
-   │
-   ▼
-OpenAI 兼容 API
-   │
-   ▼
-钉钉文本回复
+钉钉 Stream ─┐
+             ├─ dingtalk-weixin-codex-gateway ── 本地 Codex Bridge ── Codex CLI
+微信 iLink ──┘                 │
+                               └─ 管理控制台 / 聊天记录 / SQLite
 ```
 
-## 前置条件
+Compose 默认启动三个职责明确的容器：
 
-- Docker Desktop 或支持 Docker Compose 的 Linux 主机。
-- 一个钉钉组织及企业内部应用。
-- 已为应用添加机器人能力，并将消息接收模式设置为 **Stream 模式**。
-- OpenAI API Key，或其他兼容 Chat Completions 的服务凭据。
+| 容器 | 作用 |
+| --- | --- |
+| `dingtalk-codex-bot-dingtalk` | 钉钉 Stream 适配器 |
+| `dingtalk-codex-bot-weixin` | 微信 iLink 长轮询适配器 |
+| `dingtalk-codex-bot-admin` | 配置和聊天记录控制台 |
+
+三个服务共享 `data/`，但可以独立重启。`data/`、`.env` 和令牌均不会进入 Git。
 
 ## 快速开始
 
-### 1. 获取项目
-
-```bash
-git clone https://github.com/iwnsly/dingtalk-codex-bot.git
-cd dingtalk-codex-bot
-```
-
-### 2. 配置环境变量
+### 1. 配置环境
 
 ```bash
 cp .env.example .env
 ```
 
-编辑 `.env`，至少填写：
+至少设置本地 Codex Bridge Token。钉钉模式还需要填写：
 
 ```dotenv
-DINGTALK_CLIENT_ID=你的应用ClientID
-DINGTALK_CLIENT_SECRET=你的应用ClientSecret
-OPENAI_API_KEY=你的APIKey
+DINGTALK_CLIENT_ID=你的钉钉应用 Client ID
+DINGTALK_CLIENT_SECRET=你的钉钉应用 Client Secret
+AI_BACKEND=codex
+CODEX_BRIDGE_TOKEN=与宿主机 Bridge 相同的随机 Token
 ```
 
-### 3. 启动机器人
+### 2. 启动
 
 ```bash
 docker compose up -d --build
-docker compose logs -f bot
 ```
 
-停止服务：
+启动宿主机 Bridge（示例）：
 
 ```bash
-docker compose down
+CODEX_BRIDGE_TOKEN=你的随机Token \
+python3 bridge.py
 ```
+
+### 3. 打开控制台
+
+访问 [http://127.0.0.1:8080](http://127.0.0.1:8080)，默认密码为 `12345`。登录后在“配置”选项卡选择钉钉或微信，也可以修改管理密码。
+
+## 微信登录
+
+选择微信并保存后，微信容器会直接访问腾讯 iLink API 获取二维码。二维码会出现在控制台“配置”页，手机扫码确认即可。
+
+登录凭据保存在：
+
+```text
+data/weixin_token.json
+```
+
+微信消息通过 `getupdates` 长轮询接收，通过 `sendmessage` 回复。当前主要支持私聊文本消息。
+
+## 聊天记录
+
+控制台的“聊天记录”选项卡支持：
+
+- 微信 / 钉钉分开查看；
+- 今天、昨天、本周、上周、本月、上月、本年度快捷筛选；
+- 自定义开始时间和结束时间；
+- 查看时间、渠道、角色、会话和消息内容。
+
+记录保存在 `data/bot.db`，SQLite 表中的 `platform` 字段区分 `wechat` 和 `dingtalk`。
 
 ## 配置参考
 
-| 变量 | 必填 | 默认值 | 说明 |
-| --- | --- | --- | --- |
-| `DINGTALK_CLIENT_ID` | 是 | 无 | 钉钉应用 Client ID，也称 AppKey |
-| `DINGTALK_CLIENT_SECRET` | 是 | 无 | 钉钉应用 Client Secret，也称 AppSecret |
-| `OPENAI_API_KEY` | 是 | 无 | OpenAI 或兼容服务的 API Key |
-| `OPENAI_BASE_URL` | 否 | `https://api.openai.com/v1` | OpenAI 兼容 API 根地址 |
-| `OPENAI_MODEL` | 否 | `gpt-5-mini` | 调用的模型名称 |
-| `SYSTEM_PROMPT` | 否 | 内置工作助手提示词 | 机器人的系统提示词 |
-| `COMMAND_PREFIX` | 否 | 空 | 仅响应指定前缀，例如 `/工作` |
-| `ALLOWED_USERS` | 否 | 空 | 允许使用的 Staff ID，多个值用逗号分隔 |
-| `MAX_INPUT_CHARS` | 否 | `6000` | 单条用户消息最大字符数 |
-| `MAX_HISTORY_MESSAGES` | 否 | `12` | 每次请求携带的历史消息数量 |
-| `REQUEST_TIMEOUT_SECONDS` | 否 | `120` | AI 请求总超时时间 |
-| `DB_PATH` | 否 | `/app/data/bot.db` | 容器内 SQLite 数据库路径 |
-| `LOG_LEVEL` | 否 | `INFO` | 日志级别 |
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `DINGTALK_CLIENT_ID` | 空 | 钉钉应用 Client ID |
+| `DINGTALK_CLIENT_SECRET` | 空 | 钉钉应用 Client Secret |
+| `AI_BACKEND` | `openai` | `codex` 或 `openai` |
+| `CODEX_BRIDGE_URL` | `http://host.docker.internal:8787/v1/chat` | 本地 Bridge 地址 |
+| `CODEX_BRIDGE_TOKEN` | 空 | Bridge Bearer Token |
+| `CODEX_BIN` | Codex Desktop CLI 路径 | Bridge 使用的 Codex 可执行文件 |
+| `CODEX_CWD` | 当前目录 | Codex 工作目录 |
+| `ADMIN_PASSWORD` | `12345` | 控制台初始密码，可在界面修改 |
+| `DB_PATH` | `/app/data/bot.db` | SQLite 路径 |
 
-## 使用方式
+## 安全边界
 
-如果 `COMMAND_PREFIX` 留空，机器人会处理收到的所有文本消息：
+- 管理控制台默认只绑定 `127.0.0.1:8080`。
+- Bridge 默认只监听 `127.0.0.1`，必须使用 Bearer Token。
+- Codex Bridge 使用只读沙箱，不提供终端、文件修改或系统管理能力。
+- 不要提交 `.env`、数据库、微信 Token、钉钉 Secret 或 GitHub Token。
+- 曾经在聊天中暴露的密钥应立即撤销并重新生成。
 
-```text
-请把下面的会议记录整理成待办事项……
-```
-
-如果配置 `COMMAND_PREFIX=/工作`：
-
-```text
-/工作 请帮我草拟一封客户跟进邮件
-```
-
-重置当前会话上下文：
-
-```text
-/reset
-```
-
-或：
-
-```text
-重置会话
-```
-
-## 数据与隐私
-
-- 聊天记录保存在宿主机的 `data/bot.db`。
-- 用户消息和必要的会话历史会发送到所配置的 AI 服务商。
-- `.env`、数据库和 Python 缓存已加入 `.gitignore`。
-- 正式部署建议配置 `ALLOWED_USERS`，并使用专用、低权限 API Key。
-- 请勿在 Issue、日志或提交记录中公开任何密钥。
-
-## 项目结构
-
-```text
-.
-├── app.py                 # Stream 消息处理、AI 请求与 SQLite 会话
-├── Dockerfile             # 运行镜像
-├── docker-compose.yml     # 容器编排与数据卷
-├── requirements.txt       # Python 依赖
-├── .env.example           # 环境变量模板
-├── .github/workflows      # GitHub Actions
-├── CONTRIBUTING.md        # 贡献说明
-├── SECURITY.md            # 安全漏洞报告方式
-└── LICENSE                # MIT License
-```
-
-## 开发与检查
+## 开发检查
 
 ```bash
-python -m py_compile app.py
+python3 -m py_compile app.py admin.py bridge.py weixin.py
+docker compose config
 docker compose build
 ```
-
-提交 Pull Request 前，请确保没有提交 `.env`、数据库、访问令牌或应用密钥。
-
-## 路线图
-
-- [ ] 钉钉互动卡片和流式状态反馈
-- [ ] 群聊与单聊独立触发策略
-- [ ] 管理员命令与会话统计
-- [ ] 可选的消息脱敏和保留周期
-- [ ] 更多 OpenAI 兼容响应格式
-
-## 贡献与安全
-
-开发流程见 [CONTRIBUTING.md](CONTRIBUTING.md)。安全问题请不要创建公开 Issue，报告方式见 [SECURITY.md](SECURITY.md)。
 
 ## License
 
