@@ -1,11 +1,13 @@
-# DingTalk AI Work Bot
+# DingTalk Codex Bot
 
-[![CI](https://github.com/ke-huang-cn/dingtalk-ai-work-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/ke-huang-cn/dingtalk-ai-work-bot/actions/workflows/ci.yml)
+[![CI](https://github.com/ke-huang-cn/dingtalk-codex-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/ke-huang-cn/dingtalk-codex-bot/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![DingTalk Stream](https://img.shields.io/badge/DingTalk-Stream-1677FF)](https://github.com/open-dingtalk/dingtalk-stream-sdk-python)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 一个轻量、可自部署的钉钉 AI 工作助手。项目直接使用钉钉官方 Stream SDK 连接机器人，不需要公网回调地址，也不依赖 LangBot 等付费连接服务。
+
+> 项目名中的 Codex 表示面向工作任务的智能助手。当前版本调用 OpenAI 兼容 API，不连接或依赖 Codex 桌面客户端。
 
 ## 项目定位
 
@@ -37,7 +39,7 @@
 钉钉 Stream 长连接
    │
    ▼
-DingTalk AI Work Bot
+DingTalk Codex Bot
    ├── 用户白名单 / 前缀检查
    ├── SQLite 会话上下文
    └── 并发、长度与超时限制
@@ -61,8 +63,8 @@ OpenAI 兼容 API
 ### 1. 获取项目
 
 ```bash
-git clone https://github.com/ke-huang-cn/dingtalk-ai-work-bot.git
-cd dingtalk-ai-work-bot
+git clone https://github.com/ke-huang-cn/dingtalk-codex-bot.git
+cd dingtalk-codex-bot
 ```
 
 ### 2. 配置环境变量

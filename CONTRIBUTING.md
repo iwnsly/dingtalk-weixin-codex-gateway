@@ -1,6 +1,6 @@
 # Contributing
 
-感谢你参与改进 DingTalk AI Work Bot。
+感谢你参与改进 DingTalk Codex Bot。
 
 ## 开发流程
 

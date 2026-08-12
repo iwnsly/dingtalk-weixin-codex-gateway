@@ -1,7 +1,7 @@
 services:
   bot:
     build: .
-    container_name: dingtalk-ai-bot
+    container_name: dingtalk-codex-bot
     restart: unless-stopped
     env_file:
       - path: .env
