@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import asyncio, base64, json, logging, os, secrets, struct, uuid
+import asyncio, base64, hashlib, json, logging, os, secrets, struct, uuid
 import io
 from pathlib import Path
 from urllib.parse import quote
+from urllib.parse import unquote
 import aiohttp
 import sqlite3
 
@@ -17,6 +18,9 @@ CODEX_TOKEN = os.getenv('CODEX_BRIDGE_TOKEN', '')
 PROGRESS_INTERVAL = max(10, int(os.getenv('PROGRESS_INTERVAL_SECONDS', '30')))
 LOG = logging.getLogger('dingtalk-codex-bot.weixin')
 DB = DATA / 'bot.db'
+CODEX_CWD = Path(os.getenv('CODEX_CWD', str(Path.cwd()))).resolve()
+FILES_DIR = DATA / 'wechat_files'
+MAX_FILE_BYTES = 10 * 1024 * 1024
 
 def record(session_id: str, role: str, content: str) -> None:
     conn = sqlite3.connect(DB)
@@ -70,6 +74,61 @@ class WeixinClient:
                     error = result.get('errcode') or result.get('ret')
                     if error: raise RuntimeError(result.get('errmsg') or f'sendmessage error {error}')
 
+    async def _post_json(self, endpoint, payload):
+        payload['base_info'] = {'channel_version': '1.0.0'}
+        async with self.s.post(f'{self.base_url}/{endpoint}', json=payload, headers=self.headers()) as r:
+            body = json.loads(await r.text())
+            if r.status >= 400 or body.get('errcode') or body.get('ret'):
+                raise RuntimeError(body.get('errmsg') or body.get('errcode') or body.get('ret') or f'HTTP {r.status}')
+            return body
+
+    @staticmethod
+    def _decrypt(encrypted, aes_key):
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        from cryptography.hazmat.primitives.padding import PKCS7
+        raw = base64.b64decode(aes_key)
+        key = bytes.fromhex(raw.decode()) if len(raw) == 32 else raw
+        decryptor = Cipher(algorithms.AES(key), modes.ECB()).decryptor()
+        padded = decryptor.update(encrypted) + decryptor.finalize()
+        unpadder = PKCS7(128).unpadder()
+        return unpadder.update(padded) + unpadder.finalize()
+
+    @staticmethod
+    def _encrypt(data):
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        from cryptography.hazmat.primitives.padding import PKCS7
+        key = os.urandom(16); key_hex = key.hex()
+        padder = PKCS7(128).padder()
+        padded = padder.update(data) + padder.finalize()
+        encryptor = Cipher(algorithms.AES(key), modes.ECB()).encryptor()
+        encrypted = encryptor.update(padded) + encryptor.finalize()
+        return key_hex, base64.b64encode(key_hex.encode()).decode(), encrypted, hashlib.md5(data).hexdigest()
+
+    async def download_file(self, media, target):
+        query = media.get('encrypt_query_param'); aes_key = media.get('aes_key')
+        if not query or not aes_key: raise RuntimeError('微信文件缺少 CDN 加密参数')
+        async with self.s.get(f'https://novac2c.cdn.weixin.qq.com/c2c/download?encrypted_query_param={quote(query, safe="")}') as r:
+            if r.status >= 400: raise RuntimeError(f'微信文件下载失败 HTTP {r.status}')
+            encrypted = await r.read()
+        if len(encrypted) > MAX_FILE_BYTES * 2: raise RuntimeError('文件超过 10 MB 限制')
+        target.write_bytes(self._decrypt(encrypted, aes_key))
+
+    async def send_file(self, to, path, context=''):
+        data = path.read_bytes()
+        if len(data) > MAX_FILE_BYTES: raise RuntimeError('文件超过 10 MB 限制')
+        key_hex, encoded_key, encrypted, md5 = self._encrypt(data)
+        filekey = os.urandom(16).hex()
+        upload = await self._post_json('ilink/bot/getuploadurl', {'filekey': filekey, 'media_type': 3, 'to_user_id': to, 'rawsize': len(data), 'rawfilemd5': md5, 'filesize': len(encrypted), 'no_need_thumb': True, 'aeskey': key_hex})
+        param = upload.get('upload_param')
+        if not param: raise RuntimeError('微信未返回文件上传参数')
+        url = f'https://novac2c.cdn.weixin.qq.com/c2c/upload?encrypted_query_param={quote(param, safe="")}&filekey={quote(filekey, safe="")}'
+        async with self.s.post(url, data=encrypted, headers={'Content-Type': 'application/octet-stream'}) as r:
+            if r.status >= 400: raise RuntimeError(f'微信文件上传失败 HTTP {r.status}')
+            download_param = r.headers.get('x-encrypted-param', '')
+        if not download_param: raise RuntimeError('微信上传成功但未返回下载参数')
+        item = {'type': 4, 'file_item': {'media': {'encrypt_query_param': download_param, 'aes_key': encoded_key, 'encrypt_type': 1}, 'file_name': path.name, 'md5': md5, 'len': str(len(data))}}
+        await self._post_json('ilink/bot/sendmessage', {'msg': {'from_user_id': '', 'to_user_id': to, 'client_id': f'bot-{uuid.uuid4().hex[:12]}', 'message_type': 2, 'message_state': 2, 'item_list': [item], 'context_token': context or None}})
+
 async def login():
     c=WeixinClient()
     try:
@@ -117,6 +176,7 @@ async def main():
                     has_voice = False
                     has_untranscribed_voice = False
                     media_types = set()
+                    received_files = []
                     for item in items:
                         item_type = item.get('type')
                         if item_type == 1:
@@ -132,6 +192,8 @@ async def main():
                                 has_untranscribed_voice = True
                         elif item_type in {2, 4, 5}:
                             media_types.add({2: 'image', 4: 'file', 5: 'video'}[item_type])
+                            if item_type == 4:
+                                received_files.append(item.get('file_item') or {})
                     text = ''.join(text_parts).strip()
                     if has_voice:
                         LOG.info('Received WeChat voice message (transcript=%s)', bool(text))
@@ -142,7 +204,26 @@ async def main():
                             LOG.info('Sent WeChat voice transcription unavailable notice')
                         else:
                             LOG.info('Ignored unsupported non-text WeChat message')
-                        if media_types:
+                        if received_files:
+                            sid = msg.get('from_user_id') or msg.get('session_id') or 'wechat'
+                            session_dir = FILES_DIR / hashlib.sha256(sid.encode()).hexdigest()[:16]
+                            session_dir.mkdir(parents=True, exist_ok=True)
+                            downloaded = []
+                            for file_item in received_files:
+                                name = Path(file_item.get('file_name') or f'wechat-{uuid.uuid4().hex[:8]}.bin').name
+                                target = session_dir / name
+                                try:
+                                    await c.download_file(file_item.get('media') or {}, target)
+                                    downloaded.append((name, target))
+                                except Exception:
+                                    LOG.exception('Failed to download WeChat file')
+                            if downloaded:
+                                paths = '\n'.join(f'- {name}: {path.relative_to(DATA.parent)}' for name, path in downloaded)
+                                await c.send(sid, f'文件已接收并保存到本地：\n{paths}\n\n你可以继续说明要如何处理这些文件。', msg.get('context_token',''))
+                                record(f'wechat:{sid}', 'user', '[文件] ' + ', '.join(name for name, _ in downloaded))
+                            else:
+                                await c.send(sid, '已收到文件，但下载失败，请重新发送。', msg.get('context_token',''))
+                        elif media_types:
                             sid = msg.get('from_user_id') or msg.get('session_id') or 'wechat'
                             labels = {'image': '图片', 'file': '文件', 'video': '视频'}
                             kinds = '、'.join(labels[k] for k in sorted(media_types))
@@ -150,6 +231,19 @@ async def main():
                             LOG.info('Sent WeChat media capability notice: %s', ','.join(sorted(media_types)))
                         continue
                     sid=msg.get('from_user_id') or msg.get('session_id') or 'wechat'
+                    lowered = text.strip()
+                    if lowered.startswith('发送文件') or lowered.lower().startswith('send file'):
+                        raw_path = lowered.split(':', 1)[1].strip() if ':' in lowered else lowered.split(None, 1)[1].strip() if len(lowered.split(None, 1)) > 1 else ''
+                        candidate = (CODEX_CWD / raw_path).resolve() if not os.path.isabs(raw_path) else Path(raw_path).resolve()
+                        try:
+                            candidate.relative_to(CODEX_CWD)
+                            if not candidate.is_file(): raise RuntimeError('文件不存在')
+                            await c.send(sid, f'正在发送文件：{candidate.name}', msg.get('context_token',''))
+                            await c.send_file(sid, candidate, msg.get('context_token',''))
+                            record(f'wechat:{sid}', 'assistant', f'[文件已发送] {candidate.name}')
+                        except Exception as exc:
+                            await c.send(sid, f'发送文件失败：{exc}', msg.get('context_token',''))
+                        continue
                     LOG.info('Forwarding WeChat message to local Codex')
                     record(f'wechat:{sid}', 'user', text)
                     context = msg.get('context_token','')
