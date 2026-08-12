@@ -45,7 +45,7 @@ Compose 默认启动三个职责明确的容器：
 cp .env.example .env
 ```
 
-至少设置本地 Codex Bridge Token。钉钉模式还需要填写：
+至少设置本地 Codex Bridge Token。选择钉钉渠道时还需要填写：
 
 ```dotenv
 DINGTALK_CLIENT_ID=你的钉钉应用 Client ID
@@ -53,6 +53,8 @@ DINGTALK_CLIENT_SECRET=你的钉钉应用 Client Secret
 AI_BACKEND=codex
 CODEX_BRIDGE_TOKEN=与宿主机 Bridge 相同的随机 Token
 ```
+
+选择微信渠道时不需要填写钉钉凭据，登录控制台后扫码即可完成认证。
 
 ### 2. 启动
 
@@ -67,7 +69,14 @@ CODEX_BRIDGE_TOKEN=你的随机Token \
 python3 bridge.py
 ```
 
-默认 Bridge 使用 Codex 只读沙箱。登录管理控制台后，在“配置”页的“Codex 权限”中可以打开“完全权限”。打开后 Codex 可修改工作目录文件、执行命令并访问宿主机资源；仅建议在可信的个人工作环境中使用。权限开关保存在 `data/runtime.json`，Bridge 会在每次请求时读取，关闭即可恢复只读模式。
+默认 Bridge 使用 Codex 只读沙箱。登录管理控制台后，在“配置”页的“Codex 权限”中可以打开“完全权限”。
+
+| 模式 | 能力 | 建议 |
+| --- | --- | --- |
+| 只读（默认） | 读取项目、分析代码、回答问题 | 日常使用 |
+| 完全权限 | 修改文件、执行命令、访问 `CODEX_CWD` 下的宿主机资源 | 仅在可信的个人工作环境中临时开启 |
+
+权限开关保存在 `data/runtime.json`，Bridge 会在每次请求时读取，关闭即可恢复只读模式。完全权限不会绕过 IM 网关鉴权，仍受 Bridge Token、管理员登录和渠道配置保护。
 
 ### 3. 打开控制台
 
@@ -83,13 +92,15 @@ python3 bridge.py
 data/weixin_token.json
 ```
 
-微信消息通过 `getupdates` 长轮询接收，通过 `sendmessage` 回复。当前主要支持私聊文本消息。
+微信消息通过 `getupdates` 长轮询接收，通过 `sendmessage` 回复。当前主要支持私聊文本消息；群聊、平台策略限制和账号权限以微信 iLink API 实际返回为准。
 
 ### 媒体消息边界
 
 - 微信和钉钉语音：优先使用平台回调提供的服务端转写文本；没有转写时会返回明确提示。
 - 微信和钉钉图片、文件、视频：可以识别并确认收到，不会静默丢弃。
 - 当前尚未接入媒体下载、OCR/视觉识别、音频转写兜底和二进制媒体发送；两个渠道的自动回复仍为文本。
+
+发送语音、图片或文件时，系统会确认收到并说明当前处理边界，不会假装已经完成识别或解析。
 
 ## 聊天记录
 
@@ -114,6 +125,9 @@ data/weixin_token.json
 | `CODEX_RUNTIME_CONFIG_PATH` | `./data/runtime.json` | 完全权限开关配置文件路径 |
 | `CODEX_BIN` | Codex Desktop CLI 路径 | Bridge 使用的 Codex 可执行文件 |
 | `CODEX_CWD` | 当前目录 | Codex 工作目录 |
+| `CODEX_BRIDGE_HOST` | `127.0.0.1` | Bridge 监听地址，建议保持本机回环地址 |
+| `CODEX_BRIDGE_PORT` | `8787` | Bridge 监听端口 |
+| `CODEX_BRIDGE_TIMEOUT_SECONDS` | `180` | 单次 Codex 请求超时时间 |
 | `ADMIN_PASSWORD` | `12345` | 控制台初始密码，可在界面修改 |
 | `DB_PATH` | `/app/data/bot.db` | SQLite 路径 |
 
@@ -122,6 +136,8 @@ data/weixin_token.json
 - 管理控制台默认只绑定 `127.0.0.1:8080`。
 - Bridge 默认只监听 `127.0.0.1`，必须使用 Bearer Token。
 - Codex Bridge 默认使用只读沙箱；完全权限是显式开关，打开后会允许命令执行和文件修改。
+- 完全权限开关只应对可信用户开放；不要把管理端口或 Bridge 端口暴露到公网。
+- `CODEX_CWD` 决定完全权限模式下 Codex 可操作的工作目录，请不要指向包含无关敏感资料的目录。
 - 不要提交 `.env`、数据库、微信 Token、钉钉 Secret 或 GitHub Token。
 - 曾经在聊天中暴露的密钥应立即撤销并重新生成。
 
