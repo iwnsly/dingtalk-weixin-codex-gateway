@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio, base64, hashlib, json, logging, os, secrets, struct, uuid
 import io
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
 from urllib.parse import unquote
+from zoneinfo import ZoneInfo
 import aiohttp
 import sqlite3
 
@@ -21,6 +23,7 @@ DB = DATA / 'bot.db'
 CODEX_CWD = Path(os.getenv('CODEX_CWD', str(Path.cwd()))).resolve()
 FILES_DIR = DATA / 'wechat_files'
 MEDIA_KEY_CACHE = DATA / 'wechat_media_keys.json'
+SCHEDULE_FILE = DATA / 'scheduled_jobs.json'
 MAX_FILE_BYTES = 50 * 1024 * 1024
 
 def record(session_id: str, role: str, content: str) -> None:
@@ -30,6 +33,73 @@ def record(session_id: str, role: str, content: str) -> None:
     if 'platform' not in columns: conn.execute("ALTER TABLE messages ADD COLUMN platform TEXT NOT NULL DEFAULT 'dingtalk'")
     conn.execute('INSERT INTO messages(session_id, role, content, platform) VALUES (?, ?, ?, ?)', (session_id, role, content, 'wechat'))
     conn.commit(); conn.close()
+
+def load_scheduled_jobs():
+    try:
+        value = json.loads(SCHEDULE_FILE.read_text(encoding='utf-8')) if SCHEDULE_FILE.exists() else []
+        return value if isinstance(value, list) else []
+    except (OSError, ValueError):
+        LOG.exception('Unable to read scheduled jobs')
+        return []
+
+def save_scheduled_jobs(jobs):
+    temporary = SCHEDULE_FILE.with_suffix('.tmp')
+    temporary.write_text(json.dumps(jobs, ensure_ascii=False, indent=2), encoding='utf-8')
+    temporary.replace(SCHEDULE_FILE)
+
+async def request_codex(session_id, prompt):
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            CODEX_URL,
+            headers={'Authorization': f'Bearer {CODEX_TOKEN}'},
+            json={'session_id': f'wechat:{session_id}', 'prompt': prompt},
+        ) as response:
+            body = await response.json(content_type=None)
+            if response.status >= 400:
+                raise RuntimeError(body.get('error') or f'Codex bridge HTTP {response.status}')
+            return body
+
+def fortune_prompt(job, today):
+    return f'''请为黄克生成 {today} 的今日运势并直接给出可发送给用户的中文正文。
+依据：公历 1982 年 7 月 13 日 00:30，出生地河南开封。时区使用 Asia/Shanghai。
+要求：结合传统八字/民俗角度，包含整体、事业、财运、健康、人际、幸运色、幸运数字和今日建议；控制在 500 字以内，表达具体、克制，不要声称能够科学预测，不要提供医疗、投资等高风险确定性结论。开头写“今日运势｜{today}”，结尾注明“仅供民俗文化参考”。不要解释生成过程。'''
+
+async def run_scheduled_jobs(client):
+    while True:
+        try:
+            jobs = load_scheduled_jobs()
+            for job in jobs:
+                if not job.get('enabled', True) or job.get('type') != 'daily_fortune':
+                    continue
+                timezone = ZoneInfo(job.get('timezone', 'Asia/Shanghai'))
+                now = datetime.now(timezone)
+                today = now.date().isoformat()
+                start_date = job.get('start_date', today)
+                hour, minute = (int(part) for part in job.get('time', '08:00').split(':', 1))
+                if today < start_date or (now.hour, now.minute) < (hour, minute):
+                    continue
+                if job.get('last_sent_date') == today:
+                    continue
+                session_id = job.get('session_id', '').removeprefix('wechat:')
+                if not session_id:
+                    LOG.error('Scheduled job %s has no session_id', job.get('id'))
+                    continue
+                LOG.info('Running scheduled job %s for %s', job.get('id'), session_id)
+                body = await request_codex(session_id, fortune_prompt(job, today))
+                answer = body.get('answer') or ''
+                if not answer:
+                    raise RuntimeError('Codex returned an empty scheduled response')
+                await client.send(session_id, answer)
+                record(f'wechat:{session_id}', 'assistant', answer)
+                job['last_sent_date'] = today
+                job['last_sent_at'] = now.isoformat()
+                save_scheduled_jobs(jobs)
+                LOG.info('Sent scheduled job %s', job.get('id'))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOG.exception('Scheduled job processing failed; will retry')
+        await asyncio.sleep(30)
 
 def uin():
     return base64.b64encode(str(struct.unpack('>I', os.urandom(4))[0]).encode()).decode()
@@ -216,6 +286,7 @@ async def main():
     else:
         LOG.info('Starting QR login; open admin page for QR URL'); c=await login()
     buf=''
+    scheduler = asyncio.create_task(run_scheduled_jobs(c))
     try:
         while True:
             try:
@@ -230,7 +301,7 @@ async def main():
                     has_voice = False
                     has_untranscribed_voice = False
                     media_types = set()
-                    received_files = []
+                    received_media = []
                     for item in items:
                         item_type = item.get('type')
                         if item_type == 1:
@@ -246,8 +317,10 @@ async def main():
                                 has_untranscribed_voice = True
                         elif item_type in {2, 4, 5}:
                             media_types.add({2: 'image', 4: 'file', 5: 'video'}[item_type])
-                            if item_type == 4:
-                                received_files.append(item.get('file_item') or {})
+                            if item_type == 2:
+                                received_media.append(('图片', item.get('image_item') or item.get('media') or item))
+                            elif item_type == 4:
+                                received_media.append(('文件', item.get('file_item') or {}))
                     text = ''.join(text_parts).strip()
                     if has_voice:
                         LOG.info('Received WeChat voice message (transcript=%s)', bool(text))
@@ -255,15 +328,18 @@ async def main():
                     context = msg.get('context_token','')
                     downloaded_files = []
                     file_failures = []
-                    if received_files:
+                    if received_media:
                         session_dir = FILES_DIR / hashlib.sha256(sid.encode()).hexdigest()[:16]
                         session_dir.mkdir(parents=True, exist_ok=True)
-                        for file_item in received_files:
-                            name = Path(file_item.get('file_name') or f'wechat-{uuid.uuid4().hex[:8]}.bin').name
+                        for label, file_item in received_media:
+                            media = file_item.get('media') or {}
+                            if label == '图片' and not media:
+                                media = file_item.get('image') or file_item.get('image_media') or {}
+                            suffix = '.png' if label == '图片' else '.bin'
+                            name = Path(file_item.get('file_name') or file_item.get('name') or f'wechat-{uuid.uuid4().hex[:8]}{suffix}').name
                             target = session_dir / name
                             try:
-                                expected_size = int(file_item.get('len') or 0)
-                                media = file_item.get('media') or {}
+                                expected_size = int(file_item.get('len') or file_item.get('file_size') or file_item.get('size') or 0)
                                 LOG.info('WeChat file field names: item=%s media=%s; encrypt_type=%s query_len=%d full_url_len=%d media_key_len=%d item_key_len=%d expected_size=%d md5_len=%d', sorted(file_item.keys()), sorted(media.keys()), media.get('encrypt_type'), len(str(media.get('encrypt_query_param') or '')), len(str(media.get('full_url') or '')), len(str(media.get('aes_key') or '')), len(str(file_item.get('aeskey') or '')), expected_size, len(str(file_item.get('md5') or '')))
                                 await c.download_file(
                                     media,
@@ -272,11 +348,11 @@ async def main():
                                     file_item.get('md5', ''),
                                     expected_size,
                                 )
-                                downloaded_files.append((name, target))
+                                downloaded_files.append((label, name, target))
                             except RuntimeError as exc:
                                 if str(exc) == 'WECHAT_CDN_KEY_MISMATCH':
                                     file_failures.append('key_mismatch')
-                                    LOG.warning('WeChat CDN key mismatch for file %s (known server-side deduplication issue)', name)
+                                    LOG.warning('WeChat CDN key mismatch for %s (known server-side deduplication issue)', name)
                                 else:
                                     file_failures.append('download')
                                     LOG.exception('Failed to download WeChat file')
@@ -285,8 +361,8 @@ async def main():
                                 LOG.exception('Failed to download WeChat file')
                         if downloaded_files:
                             file_context = '\n'.join(
-                                f'收到的文件：{name}，本地路径：{path.relative_to(DATA.parent)}'
-                                for name, path in downloaded_files
+                                f'收到的{label}：{name}，本地路径：{path.relative_to(DATA.parent)}'
+                                for label, name, path in downloaded_files
                             )
                             text = f'{text}\n\n{file_context}'.strip() if text else file_context
                             LOG.info('Downloaded %d WeChat file(s) for Codex', len(downloaded_files))
@@ -305,7 +381,7 @@ async def main():
                         if media_types:
                             labels = {'image': '图片', 'file': '文件', 'video': '视频'}
                             kinds = '、'.join(labels[k] for k in sorted(media_types))
-                            await c.send(sid, f'已收到{kinds}消息。目前此版本支持文本、语音转写和文件处理，图片/视频暂未接入完整解析。请改发文字说明。', context)
+                            await c.send(sid, f'已收到{kinds}消息，但没有可供下载或解析的媒体参数。请稍后重试或改发文件。', context)
                             LOG.info('Sent WeChat media capability notice: %s', ','.join(sorted(media_types)))
                         continue
                     lowered = text.strip()
@@ -325,14 +401,7 @@ async def main():
                     record(f'wechat:{sid}', 'user', text)
                     await c.send(sid, '任务已收到，正在调用本地 Codex。', context)
 
-                    async def request_codex():
-                        async with aiohttp.ClientSession() as s:
-                            async with s.post(CODEX_URL,headers={'Authorization':f'Bearer {CODEX_TOKEN}'},json={'session_id':f'wechat:{sid}','prompt':text}) as r:
-                                body=await r.json(content_type=None)
-                                if r.status >= 400: raise RuntimeError(body.get('error') or f'Codex bridge HTTP {r.status}')
-                                return body
-
-                    task = asyncio.create_task(request_codex())
+                    task = asyncio.create_task(request_codex(sid, text))
                     started = asyncio.get_running_loop().time()
                     while True:
                         done, _ = await asyncio.wait({task}, timeout=PROGRESS_INTERVAL)
@@ -365,6 +434,9 @@ async def main():
             except Exception:
                 LOG.exception('WeChat polling or message processing failed')
                 await asyncio.sleep(2)
-    finally: await c.close()
+    finally:
+        scheduler.cancel()
+        await asyncio.gather(scheduler, return_exceptions=True)
+        await c.close()
 
 if __name__=='__main__': asyncio.run(main())

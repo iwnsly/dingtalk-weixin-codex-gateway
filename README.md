@@ -103,11 +103,29 @@ data/weixin_token.json
 
 微信消息通过 `getupdates` 长轮询接收，通过 `sendmessage` 回复。当前主要支持私聊文本消息；群聊、平台策略限制和账号权限以微信 iLink API 实际返回为准。
 
+### 定时主动推送
+
+微信适配器会读取 `data/scheduled_jobs.json`，支持按指定时区和时间主动发送每日内容。任务发送成功后会保存 `last_sent_date`，服务重启不会在同一天重复发送；生成或发送失败时每 30 秒重试。当前任务类型 `daily_fortune` 会通过本地 Codex Bridge 生成当日运势。
+
+```json
+[
+  {
+    "id": "daily-fortune",
+    "type": "daily_fortune",
+    "enabled": true,
+    "session_id": "wechat:用户会话 ID",
+    "timezone": "Asia/Shanghai",
+    "time": "08:00",
+    "start_date": "2026-08-13"
+  }
+]
+```
+
 ### 媒体消息边界
 
 - 微信和钉钉语音：优先使用平台回调提供的服务端转写文本；没有转写时会返回明确提示。
 - 微信文件：支持通过 iLink CDN 下载到本地，并支持从 `CODEX_CWD` 内选择文件上传回微信。
-- 微信和钉钉图片、视频：可以识别并确认收到，但尚未接入完整媒体下载、视觉识别和二进制回传。
+- 微信图片：会通过微信 CDN 下载、解密并把本地路径传给 Codex；Codex 是否能进行视觉解析取决于当前模型能力。微信视频目前只确认收到，尚未接入完整媒体下载和解析。
 - 音频没有服务端转写时仍会明确提示，不会静默丢弃。
 
 文件支持接收和发送：
@@ -117,13 +135,14 @@ data/weixin_token.json
 - 单文件限制为 50 MB；发送路径必须位于 `CODEX_CWD` 内。
 - 网关会校验解密后的文件大小和 MD5，并在 `data/wechat_media_keys.json` 中缓存已验证的 CDN 密文与密钥对应关系。
 - 腾讯微信 iLink 当前存在 FILE 类型 CDN 去重缺陷：历史上传过的相同内容可能复用旧密文，却返回新的错误 AES 密钥，客户端无法解密。遇到明确的密钥不匹配提示时，需要改变文件内容后重发，例如压缩成 ZIP 并加入一个新的说明文件；只改文件名无效。参见 [Tencent/openclaw-weixin#193](https://github.com/Tencent/openclaw-weixin/issues/193)。
-- 语音、图片和视频仍只确认收到，尚未接入完整媒体下载/发送。
+- 语音优先使用平台服务端转写；图片会下载、解密并把路径传给 Codex；视频目前仍只确认收到。
 
-钉钉图片和文件也支持接收和发送：
+钉钉图片、文件和视频支持接收，文件和图片支持发送：
 
-- 接收图片或文件后，网关通过钉钉 `downloadCode` 下载到 `data/dingtalk_files/`。
-- 发送 `发送文件 <路径>` 或 `发送图片 <路径>`，网关会从 `CODEX_CWD` 内上传并回传到钉钉。
-- 钉钉媒体同样限制为单文件 50 MB，发送路径必须位于 `CODEX_CWD` 内。
+- 接收媒体后，网关通过钉钉 `downloadCode` 下载到 `data/dingtalk_files/`，并把本地路径追加到同一条 Codex 请求中。
+- 发送 `发送文件 <路径>` 或 `发送图片 <路径>`，网关会从 `CODEX_CWD` 或 `data/dingtalk_files/` 内上传并回传到钉钉。
+- 微信和钉钉接收文件的统一流程都是“下载、校验大小、保存、把路径传给 Codex”；单个媒体最大 50 MB。
+- 钉钉媒体同样限制为单文件 50 MB，发送路径必须位于 `CODEX_CWD` 或 `data/dingtalk_files/` 内。
 
 ## 聊天记录
 
