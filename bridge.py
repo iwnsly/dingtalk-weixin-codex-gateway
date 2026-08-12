@@ -9,6 +9,7 @@ import threading
 from urllib.parse import parse_qs, urlparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from datetime import datetime, timezone
 
 
 logging.basicConfig(
@@ -26,6 +27,7 @@ TIMEOUT = int(os.getenv("CODEX_BRIDGE_TIMEOUT_SECONDS", "180"))
 MAX_INPUT = int(os.getenv("MAX_INPUT_CHARS", "6000"))
 STATUSES: dict[str, dict] = {}
 STATUS_LOCK = threading.Lock()
+STATUS_FILE = Path(os.getenv("CODEX_STATUS_FILE", str(Path(CODEX_CWD) / "data" / "codex_status.json")))
 
 
 def authorized(headers) -> bool:
@@ -45,7 +47,23 @@ def full_access_enabled() -> bool:
 
 def set_status(session_id: str, status: str, detail: str = "") -> None:
     with STATUS_LOCK:
-        STATUSES[session_id] = {"status": status, "detail": detail}
+        previous = STATUSES.get(session_id, {})
+        now = datetime.now(timezone.utc).isoformat()
+        value = {
+            "session_id": session_id,
+            "status": status,
+            "detail": detail,
+            "started_at": previous.get("started_at") or now,
+            "updated_at": now,
+        }
+        STATUSES[session_id] = value
+        try:
+            STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            tmp = STATUS_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(STATUSES, ensure_ascii=False, indent=2))
+            tmp.replace(STATUS_FILE)
+        except OSError:
+            LOGGER.warning("Unable to persist Codex status file")
 
 
 async def invoke_codex(prompt: str, session_id: str) -> str:

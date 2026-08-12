@@ -15,6 +15,7 @@ HOST = os.getenv("ADMIN_HOST", "0.0.0.0")
 PORT = int(os.getenv("ADMIN_PORT", "8080"))
 DATA = Path(os.getenv("DB_PATH", "/app/data/bot.db")).parent
 CONFIG_PATH = Path(os.getenv("CONFIG_PATH", "/app/data/runtime.json"))
+STATUS_FILE = DATA / "codex_status.json"
 PASSWORD = os.getenv("ADMIN_PASSWORD", "12345")
 SESSIONS: set[str] = set()
 LOCAL_TZ = timezone(timedelta(hours=8))
@@ -54,6 +55,16 @@ def save_config(config: dict) -> None:
     tmp.replace(CONFIG_PATH)
 
 
+def load_statuses() -> list[dict]:
+    if not STATUS_FILE.exists():
+        return []
+    try:
+        values = json.loads(STATUS_FILE.read_text())
+        return sorted(values.values(), key=lambda item: item.get("updated_at", ""), reverse=True)
+    except (OSError, ValueError, AttributeError):
+        return []
+
+
 def logged_in(handler: BaseHTTPRequestHandler) -> bool:
     cookie = SimpleCookie(handler.headers.get("Cookie", ""))
     sid = cookie.get("sid")
@@ -63,7 +74,7 @@ def logged_in(handler: BaseHTTPRequestHandler) -> bool:
 def page(title: str, body: str) -> str:
     return f"""<!doctype html><html lang=zh-CN><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>{title}</title>
 <style>:root{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#172033;background:#f4f7fb}}*{{box-sizing:border-box}}body{{margin:0}}.shell{{max-width:1180px;margin:0 auto;padding:32px 22px}}.top{{display:flex;justify-content:space-between;align-items:center;margin-bottom:24px}}.brand{{font-size:22px;font-weight:750}}.muted{{color:#667085}}.panel{{background:#fff;border:1px solid #e4e9f0;border-radius:14px;padding:22px;box-shadow:0 8px 28px #12233d0a;margin-bottom:18px}}.grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}}label{{display:block;font-size:13px;font-weight:650;margin-bottom:7px;color:#344054}}input,select{{width:100%;border:1px solid #d0d5dd;border-radius:8px;padding:10px 11px;font:inherit;background:#fff}}button{{border:0;border-radius:8px;background:#1664d9;color:white;padding:10px 16px;font:inherit;font-weight:650;cursor:pointer}}button.secondary{{background:#eef4ff;color:#1555ad}}.tabs{{display:flex;gap:8px;margin-bottom:16px}}.tab{{padding:9px 13px;border-radius:8px;text-decoration:none;color:#475467;background:#f2f4f7}}.tab.active{{background:#1664d9;color:#fff}}table{{width:100%;border-collapse:collapse;font-size:13px}}th,td{{text-align:left;padding:12px 9px;border-bottom:1px solid #eef1f5;vertical-align:top}}th{{color:#667085;font-size:12px}}td.content{{white-space:pre-wrap;max-width:680px;word-break:break-word}}.badge{{display:inline-block;padding:4px 8px;border-radius:999px;font-size:12px;font-weight:650}}.wechat{{background:#e7f8ef;color:#16804b}}.dingtalk{{background:#e8f1ff;color:#1555ad}}.login{{max-width:390px;margin:12vh auto}}img.qr{{width:220px;border-radius:10px;border:1px solid #e4e9f0}}@media(max-width:760px){{.grid{{grid-template-columns:1fr}}.shell{{padding:20px 14px}}table{{font-size:12px}}}}
-</style><div class=shell>{body}</div></html>"""
+</style><style>.task-dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:#98a2b3;margin-right:7px}.task-dot.active{background:#f5a623;box-shadow:0 0 0 4px #fff3d6}</style><div class=shell>{body}</div></html>"""
 
 
 def login_page(error="") -> str:
@@ -107,6 +118,14 @@ def dashboard(c: dict, view: str, channel: str, start: str, end: str) -> str:
         presets = [("today", "今天"), ("yesterday", "昨天"), ("week", "本周"), ("last_week", "上周"), ("month", "本月"), ("last_month", "上月"), ("year", "本年度")]
         preset_links = "".join(f"<a class='tab {'active' if active_range == key else ''}' href='/?view=records&channel={channel}&range={key}'>{label}</a>" for key, label in presets)
         body += f"<div class=panel><div class=top><h2>聊天记录</h2><span class=muted>{len(rows)} 条</span></div><div class=tabs><a class='tab {'active' if channel == 'dingtalk' else ''}' href='/?view=records&channel=dingtalk&range=today'>钉钉</a><a class='tab {'active' if channel == 'wechat' else ''}' href='/?view=records&channel=wechat&range=today'>微信</a></div><div class=tabs style='flex-wrap:wrap'>{preset_links}</div><form method=get class=grid><input type=hidden name=view value=records><input type=hidden name=channel value='{channel}'><div><label>开始时间</label><input type=datetime-local name=start value='{html.escape(start.replace(' ', 'T')[:16])}'></div><div><label>结束时间</label><input type=datetime-local name=end value='{html.escape(end.replace(' ', 'T')[:16])}'></div><div><button class=secondary>筛选记录</button></div></form><div style='overflow:auto;margin-top:16px'><table><thead><tr><th>时间</th><th>渠道</th><th>角色</th><th>会话</th><th>消息</th></tr></thead><tbody>{table}</tbody></table></div></div>"
+    task_rows = []
+    for item in load_statuses():
+        active = item.get("status") in {"working", "finalizing"}
+        task_rows.append(f"<tr><td><span class='task-dot {'active' if active else ''}'></span>{'运行中' if active else html.escape(item.get('status', 'unknown'))}</td><td>{html.escape(item.get('detail', ''))}</td><td>{html.escape(item.get('session_id', '')[:42])}</td><td>{html.escape(item.get('updated_at', '').replace('T', ' ')[:19])}</td></tr>")
+    task_table = "".join(task_rows) or "<tr><td colspan=4 class=muted>暂无任务状态</td></tr>"
+    task_panel = f"<div class=panel id=task-panel><div class=top><h2>当前任务</h2><span class=muted>自动刷新</span></div><div style='overflow:auto'><table><thead><tr><th>状态</th><th>当前阶段</th><th>会话</th><th>更新时间</th></tr></thead><tbody id=task-body>{task_table}</tbody></table></div></div>"
+    body = body.replace("<div class=tabs>", task_panel + "<div class=tabs>", 1)
+    body += "<script>setInterval(async()=>{try{const r=await fetch('/api/tasks');if(!r.ok)return;const d=await r.json();const b=document.getElementById('task-body');if(!b)return;b.innerHTML=d.tasks.map(t=>`<tr><td><span class=\"task-dot ${['working','finalizing'].includes(t.status)?'active':''}\"></span>${['working','finalizing'].includes(t.status)?'运行中':t.status}</td><td>${t.detail||''}</td><td>${(t.session_id||'').slice(0,42)}</td><td>${(t.updated_at||'').replace('T',' ').slice(0,19)}</td></tr>`).join('')||'<tr><td colspan=4 class=muted>暂无任务状态</td></tr>'}catch(e){}},5000)</script>"
     return page("控制台 - IM 网关", body)
 
 
@@ -121,6 +140,10 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/wechat/status":
             p = DATA / "weixin_qr.json"; data = p.read_text() if p.exists() else '{"status":"not_started"}'
             self.send_response(200); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(data.encode()))); self.end_headers(); self.wfile.write(data.encode()); return
+        if parsed.path == "/api/tasks":
+            if not logged_in(self): self.respond('{"error":"unauthorized"}', 401); return
+            data = json.dumps({"tasks": load_statuses()}, ensure_ascii=False)
+            self.send_response(200); self.send_header("Content-Type", "application/json; charset=utf-8"); self.send_header("Content-Length", str(len(data.encode()))); self.end_headers(); self.wfile.write(data.encode()); return
         if parsed.path == "/logout": SESSIONS.discard(self.sid()); self.respond("", 303, {"Location":"/login", "Set-Cookie":"sid=; Max-Age=0; Path=/"}); return
         if parsed.path == "/login": self.respond(login_page()); return
         if not logged_in(self): self.respond(login_page(), 401); return
