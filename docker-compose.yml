@@ -1,0 +1,10 @@
+services:
+  bot:
+    build: .
+    container_name: dingtalk-ai-bot
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - ./data:/app/data

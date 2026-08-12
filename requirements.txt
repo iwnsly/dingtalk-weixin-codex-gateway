@@ -1,0 +1,2 @@
+dingtalk-stream>=0.24.3,<1
+aiohttp>=3.10,<4
