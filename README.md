@@ -1,6 +1,6 @@
 # DingTalk Codex Bot
 
-[![CI](https://github.com/ke-huang-cn/dingtalk-codex-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/ke-huang-cn/dingtalk-codex-bot/actions/workflows/ci.yml)
+[![CI](https://github.com/iwnsly/dingtalk-codex-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/iwnsly/dingtalk-codex-bot/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![DingTalk Stream](https://img.shields.io/badge/DingTalk-Stream-1677FF)](https://github.com/open-dingtalk/dingtalk-stream-sdk-python)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
@@ -63,7 +63,7 @@ OpenAI 兼容 API
 ### 1. 获取项目
 
 ```bash
-git clone https://github.com/ke-huang-cn/dingtalk-codex-bot.git
+git clone https://github.com/iwnsly/dingtalk-codex-bot.git
 cd dingtalk-codex-bot
 ```
 
