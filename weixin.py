@@ -20,6 +20,7 @@ LOG = logging.getLogger('dingtalk-codex-bot.weixin')
 DB = DATA / 'bot.db'
 CODEX_CWD = Path(os.getenv('CODEX_CWD', str(Path.cwd()))).resolve()
 FILES_DIR = DATA / 'wechat_files'
+MEDIA_KEY_CACHE = DATA / 'wechat_media_keys.json'
 MAX_FILE_BYTES = 50 * 1024 * 1024
 
 def record(session_id: str, role: str, content: str) -> None:
@@ -83,15 +84,57 @@ class WeixinClient:
             return body
 
     @staticmethod
-    def _decrypt(encrypted, aes_key):
+    def _decode_aes_key(aes_key):
+        key_text = str(aes_key or '').strip()
+        if not key_text:
+            raise ValueError('empty key')
+        raw = base64.b64decode(key_text + ('=' * (-len(key_text) % 4)), validate=True)
+        if len(raw) == 16:
+            return raw
+        if len(raw) == 32:
+            decoded = raw.decode('ascii')
+            if all(ch in '0123456789abcdefABCDEF' for ch in decoded):
+                return bytes.fromhex(decoded)
+        raise ValueError(f'unsupported decoded key length {len(raw)}')
+
+    @staticmethod
+    def _decrypt(encrypted, aes_keys, expected_md5='', expected_size=0):
         from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
         from cryptography.hazmat.primitives.padding import PKCS7
-        raw = base64.b64decode(aes_key)
-        key = bytes.fromhex(raw.decode()) if len(raw) == 32 else raw
-        decryptor = Cipher(algorithms.AES(key), modes.ECB()).decryptor()
-        padded = decryptor.update(encrypted) + decryptor.finalize()
-        unpadder = PKCS7(128).unpadder()
-        return unpadder.update(padded) + unpadder.finalize()
+        key_texts = list(dict.fromkeys(str(value).strip() for value in aes_keys if value))
+        if not key_texts:
+            raise RuntimeError('微信文件缺少 AES 密钥')
+        for key_text in key_texts:
+            try:
+                key = WeixinClient._decode_aes_key(key_text)
+                decryptor = Cipher(algorithms.AES(key), modes.ECB()).decryptor()
+                padded = decryptor.update(encrypted) + decryptor.finalize()
+                unpadder = PKCS7(128).unpadder()
+                plain = unpadder.update(padded) + unpadder.finalize()
+            except (ValueError, TypeError, UnicodeDecodeError):
+                continue
+            if expected_size and len(plain) != expected_size:
+                continue
+            if expected_md5 and hashlib.md5(plain).hexdigest().lower() != expected_md5.lower():
+                continue
+            return plain, key_text
+        raise RuntimeError('WECHAT_CDN_KEY_MISMATCH')
+
+    @staticmethod
+    def _load_media_key_cache():
+        try:
+            value = json.loads(MEDIA_KEY_CACHE.read_text(encoding='utf-8')) if MEDIA_KEY_CACHE.exists() else {}
+            return value if isinstance(value, dict) else {}
+        except (OSError, ValueError):
+            LOG.warning('Unable to read WeChat media key cache')
+            return {}
+
+    @staticmethod
+    def _save_media_key_cache(cache):
+        try:
+            MEDIA_KEY_CACHE.write_text(json.dumps(dict(list(cache.items())[-4096:]), ensure_ascii=False), encoding='utf-8')
+        except OSError:
+            LOG.warning('Unable to persist WeChat media key cache')
 
     @staticmethod
     def _encrypt(data):
@@ -104,14 +147,25 @@ class WeixinClient:
         encrypted = encryptor.update(padded) + encryptor.finalize()
         return key_hex, base64.b64encode(key_hex.encode()).decode(), encrypted, hashlib.md5(data).hexdigest()
 
-    async def download_file(self, media, target):
-        query = media.get('encrypt_query_param'); aes_key = media.get('aes_key')
+    async def download_file(self, media, target, fallback_aes_key='', expected_md5='', expected_size=0):
+        query = media.get('encrypt_query_param'); aes_key = media.get('aes_key') or fallback_aes_key
         if not query or not aes_key: raise RuntimeError('微信文件缺少 CDN 加密参数')
-        async with self.s.get(f'https://novac2c.cdn.weixin.qq.com/c2c/download?encrypted_query_param={quote(query, safe="")}') as r:
+        full_url = str(media.get('full_url') or '').strip()
+        url = full_url or f'https://novac2c.cdn.weixin.qq.com/c2c/download?encrypted_query_param={quote(query, safe="")}'
+        LOG.info('WeChat CDN URL source: full_url=%s url_len=%d', bool(full_url), len(url))
+        async with self.s.get(url) as r:
             if r.status >= 400: raise RuntimeError(f'微信文件下载失败 HTTP {r.status}')
             encrypted = await r.read()
+            encrypted_hash = hashlib.sha256(encrypted).hexdigest()
+            LOG.info('Downloaded WeChat CDN payload: bytes=%d content_type=%s cipher_sha256=%s aes_key_len=%d', len(encrypted), r.headers.get('Content-Type', ''), encrypted_hash[:12], len(str(aes_key)))
         if len(encrypted) > MAX_FILE_BYTES * 2: raise RuntimeError('文件超过 50 MB 限制')
-        target.write_bytes(self._decrypt(encrypted, aes_key))
+        cache = self._load_media_key_cache()
+        cached_key = cache.get(encrypted_hash, '')
+        plain, working_key = self._decrypt(encrypted, (cached_key, aes_key, fallback_aes_key), expected_md5, expected_size)
+        target.write_bytes(plain)
+        if cache.get(encrypted_hash) != working_key:
+            cache[encrypted_hash] = working_key
+            self._save_media_key_cache(cache)
 
     async def send_file(self, to, path, context=''):
         data = path.read_bytes()
@@ -200,6 +254,7 @@ async def main():
                     sid = msg.get('from_user_id') or msg.get('session_id') or 'wechat'
                     context = msg.get('context_token','')
                     downloaded_files = []
+                    file_failures = []
                     if received_files:
                         session_dir = FILES_DIR / hashlib.sha256(sid.encode()).hexdigest()[:16]
                         session_dir.mkdir(parents=True, exist_ok=True)
@@ -207,9 +262,26 @@ async def main():
                             name = Path(file_item.get('file_name') or f'wechat-{uuid.uuid4().hex[:8]}.bin').name
                             target = session_dir / name
                             try:
-                                await c.download_file(file_item.get('media') or {}, target)
+                                expected_size = int(file_item.get('len') or 0)
+                                media = file_item.get('media') or {}
+                                LOG.info('WeChat file field names: item=%s media=%s; encrypt_type=%s query_len=%d full_url_len=%d media_key_len=%d item_key_len=%d expected_size=%d md5_len=%d', sorted(file_item.keys()), sorted(media.keys()), media.get('encrypt_type'), len(str(media.get('encrypt_query_param') or '')), len(str(media.get('full_url') or '')), len(str(media.get('aes_key') or '')), len(str(file_item.get('aeskey') or '')), expected_size, len(str(file_item.get('md5') or '')))
+                                await c.download_file(
+                                    media,
+                                    target,
+                                    file_item.get('aeskey', ''),
+                                    file_item.get('md5', ''),
+                                    expected_size,
+                                )
                                 downloaded_files.append((name, target))
+                            except RuntimeError as exc:
+                                if str(exc) == 'WECHAT_CDN_KEY_MISMATCH':
+                                    file_failures.append('key_mismatch')
+                                    LOG.warning('WeChat CDN key mismatch for file %s (known server-side deduplication issue)', name)
+                                else:
+                                    file_failures.append('download')
+                                    LOG.exception('Failed to download WeChat file')
                             except Exception:
+                                file_failures.append('download')
                                 LOG.exception('Failed to download WeChat file')
                         if downloaded_files:
                             file_context = '\n'.join(
@@ -219,7 +291,10 @@ async def main():
                             text = f'{text}\n\n{file_context}'.strip() if text else file_context
                             LOG.info('Downloaded %d WeChat file(s) for Codex', len(downloaded_files))
                         else:
-                            await c.send(sid, '已收到文件，但下载失败，请重新发送。', context)
+                            if file_failures and all(failure == 'key_mismatch' for failure in file_failures):
+                                await c.send(sid, '文件已收到，但微信 CDN 返回的解密密钥与附件不匹配。这是微信文件去重的已知问题。请改变文件内容后重发，例如压缩成 ZIP 并在压缩包内加入一个新的说明.txt；只改文件名无效。', context)
+                            else:
+                                await c.send(sid, '已收到文件，但下载失败，请稍后重试。', context)
                             continue
                     if not text:
                         if has_untranscribed_voice:
@@ -265,7 +340,11 @@ async def main():
                             try:
                                 body = await task
                             except Exception:
-                                await c.send(sid, '任务处理失败，请检查本地 Codex Bridge 状态后重试。', context)
+                                error_text = str(task.exception() or '') if task.done() else ''
+                                if '上游模型服务返回 502' in error_text:
+                                    await c.send(sid, '任务已送达，但本地 Codex 当前连接的上游模型服务返回 502，暂时无法生成回复。请稍后重试，或检查 ~/.codex/config.toml 的自定义 Provider 地址。', context)
+                                else:
+                                    await c.send(sid, '任务处理失败，请检查本地 Codex Bridge 状态后重试。', context)
                                 raise
                             break
                         elapsed = int(asyncio.get_running_loop().time() - started)

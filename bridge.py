@@ -93,6 +93,8 @@ async def invoke_codex(prompt: str, session_id: str) -> str:
         raise RuntimeError("本地 Codex 请求超时")
     if proc.returncode:
         detail = stderr.decode(errors="replace").strip()[-1000:]
+        if "502 Bad Gateway" in detail or "Upstream request failed" in detail:
+            raise RuntimeError("Codex 上游模型服务返回 502，当前自定义 Provider 暂时不可用；请检查 ~/.codex/config.toml 中的 model_providers.custom.base_url 或稍后重试")
         raise RuntimeError(f"本地 Codex 执行失败: {detail or proc.returncode}")
     answer = ""
     for line in stdout.decode(errors="replace").splitlines():

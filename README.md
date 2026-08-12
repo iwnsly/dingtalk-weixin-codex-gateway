@@ -72,8 +72,11 @@ docker compose up -d --build
 
 ```bash
 CODEX_BRIDGE_TOKEN=你的随机Token \
+CODEX_BRIDGE_HOST=0.0.0.0 \
 python3 bridge.py
 ```
+
+Compose 容器通过 `host.docker.internal` 访问宿主机，因此 Bridge 不能只绑定 `127.0.0.1`。Docker 部署时使用 `CODEX_BRIDGE_HOST=0.0.0.0`，并确保 `8787` 端口不向公网开放。Bridge 的聊天和状态接口都要求与容器一致的 Bearer Token。
 
 默认 Bridge 使用 Codex 只读沙箱。登录管理控制台后，在“配置”页的“Codex 权限”中可以打开“完全权限”。
 
@@ -112,6 +115,8 @@ data/weixin_token.json
 - 接收文件后，网关会通过微信 CDN 下载到 `data/wechat_files/`，并回复本地保存路径。
 - 发送 `发送文件 /相对或绝对路径`，网关会从 `CODEX_CWD` 内读取文件并上传回微信。
 - 单文件限制为 50 MB；发送路径必须位于 `CODEX_CWD` 内。
+- 网关会校验解密后的文件大小和 MD5，并在 `data/wechat_media_keys.json` 中缓存已验证的 CDN 密文与密钥对应关系。
+- 腾讯微信 iLink 当前存在 FILE 类型 CDN 去重缺陷：历史上传过的相同内容可能复用旧密文，却返回新的错误 AES 密钥，客户端无法解密。遇到明确的密钥不匹配提示时，需要改变文件内容后重发，例如压缩成 ZIP 并加入一个新的说明文件；只改文件名无效。参见 [Tencent/openclaw-weixin#193](https://github.com/Tencent/openclaw-weixin/issues/193)。
 - 语音、图片和视频仍只确认收到，尚未接入完整媒体下载/发送。
 
 钉钉图片和文件也支持接收和发送：
@@ -143,7 +148,7 @@ data/weixin_token.json
 | `CODEX_RUNTIME_CONFIG_PATH` | `./data/runtime.json` | 完全权限开关配置文件路径 |
 | `CODEX_BIN` | Codex Desktop CLI 路径 | Bridge 使用的 Codex 可执行文件 |
 | `CODEX_CWD` | 当前目录 | Codex 工作目录 |
-| `CODEX_BRIDGE_HOST` | `127.0.0.1` | Bridge 监听地址，建议保持本机回环地址 |
+| `CODEX_BRIDGE_HOST` | `127.0.0.1` | Bridge 监听地址；Docker 容器调用宿主机 Bridge 时设为 `0.0.0.0` |
 | `CODEX_BRIDGE_PORT` | `8787` | Bridge 监听端口 |
 | `CODEX_BRIDGE_TIMEOUT_SECONDS` | `180` | 单次 Codex 请求超时时间 |
 | `PROGRESS_INTERVAL_SECONDS` | `30` | IM 端任务进度通知间隔，最小 10 秒 |
@@ -153,12 +158,26 @@ data/weixin_token.json
 ## 安全边界
 
 - 管理控制台默认只绑定 `127.0.0.1:8080`。
-- Bridge 默认只监听 `127.0.0.1`，必须使用 Bearer Token。
+- Bridge 默认只监听 `127.0.0.1`；Docker 部署需监听 `0.0.0.0`，但必须使用 Bearer Token，并通过系统防火墙避免将 `8787` 暴露到公网。
 - Codex Bridge 默认使用只读沙箱；完全权限是显式开关，打开后会允许命令执行和文件修改。
 - 完全权限开关只应对可信用户开放；不要把管理端口或 Bridge 端口暴露到公网。
 - `CODEX_CWD` 决定完全权限模式下 Codex 可操作的工作目录，请不要指向包含无关敏感资料的目录。
 - 不要提交 `.env`、数据库、微信 Token、钉钉 Secret 或 GitHub Token。
 - 曾经在聊天中暴露的密钥应立即撤销并重新生成。
+
+## 故障排查
+
+### 容器无法连接 Bridge
+
+如果微信或钉钉日志出现 `Cannot connect to host host.docker.internal:8787`：
+
+1. 确认 Bridge 正在宿主机运行，并设置 `CODEX_BRIDGE_HOST=0.0.0.0`。
+2. 从容器内请求 `http://host.docker.internal:8787/health`。
+3. 确认 `.env` 中的 `CODEX_BRIDGE_TOKEN` 与启动 Bridge 时使用的 Token 一致。
+
+### Codex 上游返回 502
+
+Bridge 健康检查正常但任务仍失败，且日志包含 `502 Bad Gateway` 或 `Upstream request failed`，说明 Codex CLI 当前配置的模型 Provider 不可用或不兼容 Responses API。检查 `~/.codex/config.toml` 中的模型、`model_provider`、`base_url` 和 `wire_api`。这类故障不属于微信、钉钉或 Docker 连接问题。
 
 ## 开发检查
 
