@@ -146,6 +146,8 @@ data/weixin_token.json
 | `CODEX_BRIDGE_URL` | `http://host.docker.internal:8787/v1/chat` | 本地 Bridge 地址 |
 | `CODEX_BRIDGE_TOKEN` | 空 | Bridge Bearer Token |
 | `CODEX_RUNTIME_CONFIG_PATH` | `./data/runtime.json` | 完全权限开关配置文件路径 |
+| `CODEX_MEMORY_DIR` | `~/.codex/memories` | 本机 Codex 长期记忆目录；Bridge 会在每次微信/钉钉请求前读取其中的 Markdown 文件 |
+| `CODEX_MEMORY_CONTEXT_CHARS` | `24000` | 注入单次 Codex 请求的长期记忆最大字符数 |
 | `CODEX_BIN` | Codex Desktop CLI 路径 | Bridge 使用的 Codex 可执行文件 |
 | `CODEX_CWD` | 当前目录 | Codex 工作目录 |
 | `CODEX_BRIDGE_HOST` | `127.0.0.1` | Bridge 监听地址；Docker 容器调用宿主机 Bridge 时设为 `0.0.0.0` |
@@ -178,6 +180,21 @@ data/weixin_token.json
 ### Codex 上游返回 502
 
 Bridge 健康检查正常但任务仍失败，且日志包含 `502 Bad Gateway` 或 `Upstream request failed`，说明 Codex CLI 当前配置的模型 Provider 不可用或不兼容 Responses API。检查 `~/.codex/config.toml` 中的模型、`model_provider`、`base_url` 和 `wire_api`。这类故障不属于微信、钉钉或 Docker 连接问题。
+
+## Codex 长期记忆
+
+微信和钉钉请求经过同一个本地 Bridge。Bridge 默认读取宿主机 `~/.codex/memories` 下的 Markdown 记忆，并把完整内容注入每次临时 Codex 请求，因此两个渠道可以共享桌面 Codex 的长期记忆。由于记忆可能包含手机号、邮箱和履历等隐私信息，这些内容会随请求发送到 `~/.codex/config.toml` 配置的模型 Provider；启用前请确认 Provider 的数据处理策略。
+
+Docker 部署时，必须把宿主机记忆目录以只读方式挂载给 Bridge，并设置 `CODEX_MEMORY_DIR`，例如：
+
+```yaml
+volumes:
+  - ${CODEX_HOME:-$HOME/.codex}/memories:/codex-memories:ro
+environment:
+  CODEX_MEMORY_DIR: /codex-memories
+```
+
+如果没有挂载，Bridge 会明确记录“未读取到本机 Codex 长期记忆”，不会虚构记忆内容。
 
 ## 开发检查
 

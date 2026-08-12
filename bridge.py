@@ -28,6 +28,8 @@ MAX_INPUT = int(os.getenv("MAX_INPUT_CHARS", "6000"))
 STATUSES: dict[str, dict] = {}
 STATUS_LOCK = threading.Lock()
 STATUS_FILE = Path(os.getenv("CODEX_STATUS_FILE", str(Path(CODEX_CWD) / "data" / "codex_status.json")))
+CODEX_MEMORY_DIR = Path(os.getenv("CODEX_MEMORY_DIR", str(Path.home() / ".codex" / "memories"))).expanduser()
+MEMORY_CONTEXT_CHARS = int(os.getenv("CODEX_MEMORY_CONTEXT_CHARS", "24000"))
 
 
 def authorized(headers) -> bool:
@@ -64,6 +66,34 @@ def set_status(session_id: str, status: str, detail: str = "") -> None:
             tmp.replace(STATUS_FILE)
         except OSError:
             LOGGER.warning("Unable to persist Codex status file")
+
+
+def load_codex_memory_context() -> str:
+    """Load the local Codex memory corpus for ephemeral IM requests."""
+    if not CODEX_MEMORY_DIR.is_dir():
+        LOGGER.warning("Codex memory directory does not exist: %s", CODEX_MEMORY_DIR)
+        return ""
+    files = sorted(CODEX_MEMORY_DIR.rglob("*.md"))
+    chunks: list[str] = []
+    used = 0
+    for path in files:
+        if ".git" in path.parts:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError):
+            continue
+        if not text:
+            continue
+        chunk = f"[{path}]\n{text}"
+        remaining = MEMORY_CONTEXT_CHARS - used
+        if remaining <= 0:
+            break
+        chunks.append(chunk[:remaining])
+        used += min(len(chunk), remaining)
+    if chunks:
+        LOGGER.info("Loaded Codex memory context: %d files, %d chars", len(chunks), used)
+    return "\n\n".join(chunks)
 
 
 async def invoke_codex(prompt: str, session_id: str) -> str:
@@ -176,9 +206,19 @@ class Handler(BaseHTTPRequestHandler):
                 if full_access_enabled() else
                 "如果需要修改文件或执行操作，当前请求运行在只读沙箱；请说明限制。"
             )
+            memory_context = load_codex_memory_context()
+            memory_note = (
+                "以下是本机桌面 Codex 的完整长期记忆内容。回答涉及用户资料或历史记忆的问题时，"
+                "必须先参考这些内容；不要因为当前请求是临时会话就声称没有长期记忆。除非用户明确要求，"
+                "不要主动省略或改写记忆中的字段。\n\n"
+                f"{memory_context}\n\n"
+                if memory_context else
+                "本次未读取到本机 Codex 长期记忆内容，不要虚构已保存的资料。\n\n"
+            )
             instruction = (
             "你是通过即时通讯接入的本地 Codex 工作助手。"
             f"请直接回答用户问题；{access_note}\n\n"
+            f"{memory_note}"
             f"会话标识：{session_id}\n用户消息：{prompt}"
             )
             set_status(session_id, "working", "正在启动 Codex")
