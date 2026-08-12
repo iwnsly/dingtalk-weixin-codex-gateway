@@ -19,6 +19,7 @@ PORT = int(os.getenv("CODEX_BRIDGE_PORT", "8787"))
 TOKEN = os.getenv("CODEX_BRIDGE_TOKEN", "")
 CODEX_BIN = os.getenv("CODEX_BIN", "/Applications/ChatGPT.app/Contents/Resources/codex")
 CODEX_CWD = os.getenv("CODEX_CWD", str(Path.cwd()))
+RUNTIME_CONFIG_PATH = Path(os.getenv("CODEX_RUNTIME_CONFIG_PATH", str(Path(CODEX_CWD) / "data" / "runtime.json")))
 TIMEOUT = int(os.getenv("CODEX_BRIDGE_TIMEOUT_SECONDS", "180"))
 MAX_INPUT = int(os.getenv("MAX_INPUT_CHARS", "6000"))
 
@@ -29,14 +30,26 @@ def authorized(headers) -> bool:
     return secrets.compare_digest(headers.get("Authorization", ""), f"Bearer {TOKEN}")
 
 
+def full_access_enabled() -> bool:
+    try:
+        if RUNTIME_CONFIG_PATH.exists():
+            return bool(json.loads(RUNTIME_CONFIG_PATH.read_text()).get("full_access", False))
+    except (OSError, ValueError):
+        LOGGER.warning("Unable to read runtime permission config; using read-only mode")
+    return False
+
+
 async def invoke_codex(prompt: str) -> str:
+    full_access = full_access_enabled()
+    sandbox = "danger-full-access" if full_access else "read-only"
+    LOGGER.warning("Invoking Codex with sandbox mode: %s", sandbox)
     proc = await asyncio.create_subprocess_exec(
         CODEX_BIN,
         "exec",
         "--ephemeral",
         "--skip-git-repo-check",
         "-s",
-        "read-only",
+        sandbox,
         "--color",
         "never",
         prompt,
@@ -91,9 +104,14 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if not session_id:
                 session_id = "default"
+            access_note = (
+                "当前请求运行在完全权限模式，可以修改文件、执行命令并访问宿主机资源；仅执行用户明确要求的操作。"
+                if full_access_enabled() else
+                "如果需要修改文件或执行操作，当前请求运行在只读沙箱；请说明限制。"
+            )
             instruction = (
             "你是通过即时通讯接入的本地 Codex 工作助手。"
-            "请直接回答用户问题；如果需要修改文件或执行操作，先说明限制，当前请求运行在只读沙箱。\n\n"
+            f"请直接回答用户问题；{access_note}\n\n"
             f"会话标识：{session_id}\n用户消息：{prompt}"
             )
             answer = asyncio.run(invoke_codex(instruction))

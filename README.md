@@ -67,6 +67,8 @@ CODEX_BRIDGE_TOKEN=你的随机Token \
 python3 bridge.py
 ```
 
+默认 Bridge 使用 Codex 只读沙箱。登录管理控制台后，在“配置”页的“Codex 权限”中可以打开“完全权限”。打开后 Codex 可修改工作目录文件、执行命令并访问宿主机资源；仅建议在可信的个人工作环境中使用。权限开关保存在 `data/runtime.json`，Bridge 会在每次请求时读取，关闭即可恢复只读模式。
+
 ### 3. 打开控制台
 
 访问 [http://127.0.0.1:8080](http://127.0.0.1:8080)，默认密码为 `12345`。登录后在“配置”选项卡选择钉钉或微信，也可以修改管理密码。
@@ -109,6 +111,7 @@ data/weixin_token.json
 | `AI_BACKEND` | `openai` | `codex` 或 `openai` |
 | `CODEX_BRIDGE_URL` | `http://host.docker.internal:8787/v1/chat` | 本地 Bridge 地址 |
 | `CODEX_BRIDGE_TOKEN` | 空 | Bridge Bearer Token |
+| `CODEX_RUNTIME_CONFIG_PATH` | `./data/runtime.json` | 完全权限开关配置文件路径 |
 | `CODEX_BIN` | Codex Desktop CLI 路径 | Bridge 使用的 Codex 可执行文件 |
 | `CODEX_CWD` | 当前目录 | Codex 工作目录 |
 | `ADMIN_PASSWORD` | `12345` | 控制台初始密码，可在界面修改 |
@@ -118,7 +121,7 @@ data/weixin_token.json
 
 - 管理控制台默认只绑定 `127.0.0.1:8080`。
 - Bridge 默认只监听 `127.0.0.1`，必须使用 Bearer Token。
-- Codex Bridge 使用只读沙箱，不提供终端、文件修改或系统管理能力。
+- Codex Bridge 默认使用只读沙箱；完全权限是显式开关，打开后会允许命令执行和文件修改。
 - 不要提交 `.env`、数据库、微信 Token、钉钉 Secret 或 GitHub Token。
 - 曾经在聊天中暴露的密钥应立即撤销并重新生成。
 

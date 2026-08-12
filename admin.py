@@ -39,7 +39,7 @@ def preset_range(name: str) -> tuple[str, str]:
 
 def load_config() -> dict:
     if not CONFIG_PATH.exists():
-        return {"channel": "dingtalk", "dingtalk": {"client_id": os.getenv("DINGTALK_CLIENT_ID", ""), "client_secret": os.getenv("DINGTALK_CLIENT_SECRET", "")}, "admin_password": PASSWORD}
+        return {"channel": "dingtalk", "dingtalk": {"client_id": os.getenv("DINGTALK_CLIENT_ID", ""), "client_secret": os.getenv("DINGTALK_CLIENT_SECRET", "")}, "admin_password": PASSWORD, "full_access": False}
     return json.loads(CONFIG_PATH.read_text())
 
 
@@ -97,7 +97,10 @@ def dashboard(c: dict, view: str, channel: str, start: str, end: str) -> str:
     body = f"<div class=top><div><div class=brand>本地 Codex IM 网关</div><div class=muted>渠道配置与对话审计</div></div><a class=tab href=/logout>退出</a></div>"
     body += f"<div class=tabs><a class='tab {'active' if view == 'config' else ''}' href='/?view=config'>配置</a><a class='tab {'active' if view == 'records' else ''}' href='/?view=records&channel={channel}'>聊天记录</a></div>"
     if view == "config":
-        body += f"<div class=panel><h2>消息入口</h2><form method=post action=/config><div class=grid><div><label>当前渠道</label><select name=channel><option value=dingtalk {selected_d}>钉钉</option><option value=wechat {selected_w}>微信</option></select></div><div style='display:flex;align-items:end'><button>保存渠道</button></div></div><div class=grid style='margin-top:18px'><div><label>钉钉 Client ID</label><input name=client_id value='{html.escape(c.get('dingtalk', {}).get('client_id', ''))}'></div><div><label>钉钉 Client Secret</label><input type=password name=client_secret value='{html.escape(c.get('dingtalk', {}).get('client_secret', ''))}'></div></div></form></div>"
+        full_access = bool(c.get("full_access", False))
+        checked = "checked" if full_access else ""
+        access_panel = f"<div class=panel><h2>Codex 权限</h2><form method=post action=/permissions><label style='display:flex;gap:10px;align-items:center'><input type=checkbox name=full_access value=1 {checked} style='width:auto'>启用完全权限</label><p class=muted>关闭时使用只读沙箱。启用后 Codex 可修改文件、执行命令并访问宿主机资源，请仅在可信工作场景使用。</p><button class='secondary'>保存权限</button></form></div>"
+        body += f"<div class=panel><h2>消息入口</h2><form method=post action=/config><div class=grid><div><label>当前渠道</label><select name=channel><option value=dingtalk {selected_d}>钉钉</option><option value=wechat {selected_w}>微信</option></select></div><div style='display:flex;align-items:end'><button>保存渠道</button></div></div><div class=grid style='margin-top:18px'><div><label>钉钉 Client ID</label><input name=client_id value='{html.escape(c.get('dingtalk', {}).get('client_id', ''))}'></div><div><label>钉钉 Client Secret</label><input type=password name=client_secret value='{html.escape(c.get('dingtalk', {}).get('client_secret', ''))}'></div></div></form></div>" + access_panel
         body += f"<div class=panel><h2>微信登录</h2>{qr_html}<p class=muted>选择微信并保存后，系统自动生成二维码。扫码成功后凭据保存在本机数据目录。</p></div>"
         body += "<div class=panel><h2>管理密码</h2><form method=post action=/password><div class=grid><div><label>新密码</label><input type=password name=password minlength=5 required></div><div style='display:flex;align-items:end'><button>修改密码</button></div></div><p class=muted>默认密码为 12345，修改后立即生效。</p></form></div>"
     else:
@@ -137,8 +140,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not logged_in(self): self.respond(login_page(), 401); return
         if path == "/config":
-            old = load_config(); save_config({"channel": data.get("channel", ["dingtalk"])[0], "dingtalk": {"client_id": data.get("client_id", [""])[0], "client_secret": data.get("client_secret", [""])[0]}, "admin_password": old.get("admin_password", PASSWORD)})
+            old = load_config(); save_config({"channel": data.get("channel", ["dingtalk"])[0], "dingtalk": {"client_id": data.get("client_id", [""])[0], "client_secret": data.get("client_secret", [""])[0]}, "admin_password": old.get("admin_password", PASSWORD), "full_access": bool(old.get("full_access", False))})
             self.respond("", 303, {"Location":"/"}); return
+        if path == "/permissions":
+            old = load_config(); old["full_access"] = data.get("full_access", [""])[0] == "1"; save_config(old)
+            self.respond("", 303, {"Location":"/?view=config"}); return
         if path == "/password":
             new_password = data.get("password", [""])[0]
             if len(new_password) < 5: self.respond(login_page("密码至少需要 5 个字符"), 400); return
