@@ -18,6 +18,12 @@
 
 两个 IM 入口共享同一个 Codex Bridge，但运行时只启用一个渠道，避免重复消费和会话混乱。
 
+## 任务进度通知
+
+微信和钉钉收到任务后会立即发送确认消息。若本地 Codex 在 `PROGRESS_INTERVAL_SECONDS` 秒内没有完成，网关会定期发送已处理时长，最终再发送结果或失败提示。
+
+进度通知只表示任务状态，不会展示模型的内部推理过程，也不会写入会话历史。默认通知间隔为 30 秒，最小值为 10 秒。
+
 ## 架构
 
 ```text
@@ -128,6 +134,7 @@ data/weixin_token.json
 | `CODEX_BRIDGE_HOST` | `127.0.0.1` | Bridge 监听地址，建议保持本机回环地址 |
 | `CODEX_BRIDGE_PORT` | `8787` | Bridge 监听端口 |
 | `CODEX_BRIDGE_TIMEOUT_SECONDS` | `180` | 单次 Codex 请求超时时间 |
+| `PROGRESS_INTERVAL_SECONDS` | `30` | IM 端任务进度通知间隔，最小 10 秒 |
 | `ADMIN_PASSWORD` | `12345` | 控制台初始密码，可在界面修改 |
 | `DB_PATH` | `/app/data/bot.db` | SQLite 路径 |
 

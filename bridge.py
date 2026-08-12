@@ -5,6 +5,8 @@ import logging
 import os
 import secrets
 import json
+import threading
+from urllib.parse import parse_qs, urlparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -22,6 +24,8 @@ CODEX_CWD = os.getenv("CODEX_CWD", str(Path.cwd()))
 RUNTIME_CONFIG_PATH = Path(os.getenv("CODEX_RUNTIME_CONFIG_PATH", str(Path(CODEX_CWD) / "data" / "runtime.json")))
 TIMEOUT = int(os.getenv("CODEX_BRIDGE_TIMEOUT_SECONDS", "180"))
 MAX_INPUT = int(os.getenv("MAX_INPUT_CHARS", "6000"))
+STATUSES: dict[str, dict] = {}
+STATUS_LOCK = threading.Lock()
 
 
 def authorized(headers) -> bool:
@@ -39,7 +43,12 @@ def full_access_enabled() -> bool:
     return False
 
 
-async def invoke_codex(prompt: str) -> str:
+def set_status(session_id: str, status: str, detail: str = "") -> None:
+    with STATUS_LOCK:
+        STATUSES[session_id] = {"status": status, "detail": detail}
+
+
+async def invoke_codex(prompt: str, session_id: str) -> str:
     full_access = full_access_enabled()
     sandbox = "danger-full-access" if full_access else "read-only"
     LOGGER.warning("Invoking Codex with sandbox mode: %s", sandbox)
@@ -52,6 +61,7 @@ async def invoke_codex(prompt: str) -> str:
         sandbox,
         "--color",
         "never",
+        "--json",
         prompt,
         cwd=CODEX_CWD,
         stdout=asyncio.subprocess.PIPE,
@@ -66,10 +76,37 @@ async def invoke_codex(prompt: str) -> str:
     if proc.returncode:
         detail = stderr.decode(errors="replace").strip()[-1000:]
         raise RuntimeError(f"本地 Codex 执行失败: {detail or proc.returncode}")
-    answer = stdout.decode(errors="replace").strip()
+    answer = ""
+    for line in stdout.decode(errors="replace").splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if event.get("type") == "item.started":
+            item = event.get("item") or {}
+            set_status(session_id, "working", describe_item(item))
+        elif event.get("type") == "item.completed":
+            item = event.get("item") or {}
+            if item.get("type") == "agent_message":
+                answer = str(item.get("text") or "").strip()
+        elif event.get("type") == "turn.completed":
+            set_status(session_id, "finalizing", "正在整理最终回复")
     if not answer:
         raise RuntimeError("本地 Codex 没有返回内容")
     return answer[-18000:]
+
+
+def describe_item(item: dict) -> str:
+    item_type = item.get("type", "")
+    if item_type == "command_execution":
+        return "正在执行命令"
+    if item_type in {"file_read", "file_search"}:
+        return "正在读取或搜索文件"
+    if item_type in {"mcp_tool_call", "web_search"}:
+        return "正在调用外部工具"
+    if item_type == "agent_message":
+        return "正在生成回复"
+    return "正在分析任务"
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -84,6 +121,16 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         if self.path == "/health":
             self._json({"ok": True, "backend": "local-codex"})
+            return
+        parsed = urlparse(self.path)
+        if parsed.path == "/v1/status":
+            if not authorized(self.headers):
+                self._json({"error": "unauthorized"}, 401)
+                return
+            session_id = parse_qs(parsed.query).get("session_id", ["default"])[0]
+            with STATUS_LOCK:
+                status = STATUSES.get(session_id, {"status": "queued", "detail": "等待 Codex 启动"})
+            self._json(status)
             return
         self._json({"error": "not found"}, 404)
 
@@ -114,9 +161,12 @@ class Handler(BaseHTTPRequestHandler):
             f"请直接回答用户问题；{access_note}\n\n"
             f"会话标识：{session_id}\n用户消息：{prompt}"
             )
-            answer = asyncio.run(invoke_codex(instruction))
+            set_status(session_id, "working", "正在启动 Codex")
+            answer = asyncio.run(invoke_codex(instruction, session_id))
+            set_status(session_id, "completed", "已完成")
             self._json({"session_id": session_id, "answer": answer})
         except (ValueError, RuntimeError) as exc:
+            set_status(session_id, "failed", str(exc))
             LOGGER.warning("Bridge request failed: %s", exc)
             self._json({"error": str(exc)}, 502)
         except Exception:

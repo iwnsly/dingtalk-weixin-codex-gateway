@@ -22,6 +22,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 AI_BACKEND = os.getenv("AI_BACKEND", "openai").strip().lower()
 CODEX_BRIDGE_URL = os.getenv("CODEX_BRIDGE_URL", "http://host.docker.internal:8787/v1/chat").rstrip("/")
+CODEX_STATUS_URL = os.getenv("CODEX_STATUS_URL", CODEX_BRIDGE_URL.rsplit("/", 1)[0] + "/status")
 CODEX_BRIDGE_TOKEN = os.getenv("CODEX_BRIDGE_TOKEN", "")
 SYSTEM_PROMPT = os.getenv(
     "SYSTEM_PROMPT",
@@ -32,6 +33,7 @@ ALLOWED_USERS = {x.strip() for x in os.getenv("ALLOWED_USERS", "").split(",") if
 MAX_INPUT_CHARS = int(os.getenv("MAX_INPUT_CHARS", "6000"))
 MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "12"))
 REQUEST_TIMEOUT_SECONDS = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "120"))
+PROGRESS_INTERVAL_SECONDS = max(10, int(os.getenv("PROGRESS_INTERVAL_SECONDS", "30")))
 DB_PATH = Path(os.getenv("DB_PATH", "/app/data/bot.db"))
 RUNTIME_CONFIG_PATH = Path(os.getenv("RUNTIME_CONFIG_PATH", "/app/data/runtime.json"))
 
@@ -86,6 +88,31 @@ class ConversationStore:
 
 STORE = ConversationStore(DB_PATH)
 REQUEST_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+async def run_with_progress(coro, notify) -> str:
+    task = asyncio.create_task(coro)
+    started = asyncio.get_running_loop().time()
+    await notify("任务已收到，正在调用本地 Codex。")
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=PROGRESS_INTERVAL_SECONDS)
+            if task in done:
+                return await task
+            elapsed = int(asyncio.get_running_loop().time() - started)
+            detail = "正在处理请求"
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(CODEX_STATUS_URL, params={"session_id": notify.session_id}, headers={"Authorization": f"Bearer {CODEX_BRIDGE_TOKEN}"}, timeout=5) as response:
+                        if response.status < 400:
+                            state = await response.json(content_type=None)
+                            detail = state.get("detail") or detail
+            except Exception:
+                pass
+            await notify(f"任务仍在处理中，已用时 {elapsed} 秒，当前状态：{detail}。")
+    finally:
+        if not task.done():
+            task.cancel()
 
 
 async def ask_openai(session_id: str, prompt: str, platform: str = "dingtalk") -> str:
@@ -201,8 +228,12 @@ class WorkBotHandler(dingtalk_stream.ChatbotHandler):
             return AckMessage.STATUS_OK, "OK"
 
         async with lock:
+            async def notify(status: str) -> None:
+                await asyncio.to_thread(self.reply_text, status, message)
+            notify.session_id = session_id
+
             try:
-                answer = await ask_backend(session_id, text, "dingtalk")
+                answer = await run_with_progress(ask_backend(session_id, text, "dingtalk"), notify)
             except Exception:
                 LOGGER.exception("Failed to process message from %s", sender_id)
                 answer = "本地 Codex 暂时不可用，请检查 Bridge 状态和配置。" if AI_BACKEND == "codex" else "尚未配置 OPENAI_API_KEY，当前只能验证钉钉连接。"

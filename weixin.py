@@ -12,7 +12,9 @@ DATA = Path(os.getenv('DB_PATH', '/app/data/bot.db')).parent
 TOKEN_FILE = DATA / 'weixin_token.json'
 QR_FILE = DATA / 'weixin_qr.json'
 CODEX_URL = os.getenv('CODEX_BRIDGE_URL', 'http://host.docker.internal:8787/v1/chat')
+CODEX_STATUS_URL = os.getenv('CODEX_STATUS_URL', CODEX_URL.rsplit('/', 1)[0] + '/status')
 CODEX_TOKEN = os.getenv('CODEX_BRIDGE_TOKEN', '')
+PROGRESS_INTERVAL = max(10, int(os.getenv('PROGRESS_INTERVAL_SECONDS', '30')))
 LOG = logging.getLogger('dingtalk-codex-bot.weixin')
 DB = DATA / 'bot.db'
 
@@ -150,12 +152,40 @@ async def main():
                     sid=msg.get('from_user_id') or msg.get('session_id') or 'wechat'
                     LOG.info('Forwarding WeChat message to local Codex')
                     record(f'wechat:{sid}', 'user', text)
-                    async with aiohttp.ClientSession() as s:
-                        async with s.post(CODEX_URL,headers={'Authorization':f'Bearer {CODEX_TOKEN}'},json={'session_id':f'wechat:{sid}','prompt':text}) as r:
-                            body=await r.json(content_type=None)
-                            if r.status >= 400: raise RuntimeError(body.get('error') or f'Codex bridge HTTP {r.status}')
+                    context = msg.get('context_token','')
+                    await c.send(sid, '任务已收到，正在调用本地 Codex。', context)
+
+                    async def request_codex():
+                        async with aiohttp.ClientSession() as s:
+                            async with s.post(CODEX_URL,headers={'Authorization':f'Bearer {CODEX_TOKEN}'},json={'session_id':f'wechat:{sid}','prompt':text}) as r:
+                                body=await r.json(content_type=None)
+                                if r.status >= 400: raise RuntimeError(body.get('error') or f'Codex bridge HTTP {r.status}')
+                                return body
+
+                    task = asyncio.create_task(request_codex())
+                    started = asyncio.get_running_loop().time()
+                    while True:
+                        done, _ = await asyncio.wait({task}, timeout=PROGRESS_INTERVAL)
+                        if task in done:
+                            try:
+                                body = await task
+                            except Exception:
+                                await c.send(sid, '任务处理失败，请检查本地 Codex Bridge 状态后重试。', context)
+                                raise
+                            break
+                        elapsed = int(asyncio.get_running_loop().time() - started)
+                        detail = '正在处理请求'
+                        try:
+                            async with aiohttp.ClientSession() as status_session:
+                                async with status_session.get(CODEX_STATUS_URL, params={'session_id': f'wechat:{sid}'}, headers={'Authorization': f'Bearer {CODEX_TOKEN}'}, timeout=5) as status_response:
+                                    if status_response.status < 400:
+                                        status = await status_response.json(content_type=None)
+                                        detail = status.get('detail') or detail
+                        except Exception:
+                            pass
+                        await c.send(sid, f'任务仍在处理中，已用时 {elapsed} 秒，当前状态：{detail}。', context)
                     answer = body.get('answer') or '本地 Codex 暂时不可用。'
-                    await c.send(sid, answer, msg.get('context_token',''))
+                    await c.send(sid, answer, context)
                     record(f'wechat:{sid}', 'assistant', answer)
                     LOG.info('Sent local Codex reply to WeChat')
             except Exception:
