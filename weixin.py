@@ -197,40 +197,42 @@ async def main():
                     text = ''.join(text_parts).strip()
                     if has_voice:
                         LOG.info('Received WeChat voice message (transcript=%s)', bool(text))
+                    sid = msg.get('from_user_id') or msg.get('session_id') or 'wechat'
+                    context = msg.get('context_token','')
+                    downloaded_files = []
+                    if received_files:
+                        session_dir = FILES_DIR / hashlib.sha256(sid.encode()).hexdigest()[:16]
+                        session_dir.mkdir(parents=True, exist_ok=True)
+                        for file_item in received_files:
+                            name = Path(file_item.get('file_name') or f'wechat-{uuid.uuid4().hex[:8]}.bin').name
+                            target = session_dir / name
+                            try:
+                                await c.download_file(file_item.get('media') or {}, target)
+                                downloaded_files.append((name, target))
+                            except Exception:
+                                LOG.exception('Failed to download WeChat file')
+                        if downloaded_files:
+                            file_context = '\n'.join(
+                                f'收到的文件：{name}，本地路径：{path.relative_to(DATA.parent)}'
+                                for name, path in downloaded_files
+                            )
+                            text = f'{text}\n\n{file_context}'.strip() if text else file_context
+                            LOG.info('Downloaded %d WeChat file(s) for Codex', len(downloaded_files))
+                        else:
+                            await c.send(sid, '已收到文件，但下载失败，请重新发送。', context)
+                            continue
                     if not text:
                         if has_untranscribed_voice:
-                            sid = msg.get('from_user_id') or msg.get('session_id') or 'wechat'
-                            await c.send(sid, '已收到语音，但当前微信接口未提供语音转写文本，暂时无法识别。请改发文字，或稍后重试。', msg.get('context_token',''))
+                            await c.send(sid, '已收到语音，但当前微信接口未提供语音转写文本，暂时无法识别。请改发文字，或稍后重试。', context)
                             LOG.info('Sent WeChat voice transcription unavailable notice')
                         else:
                             LOG.info('Ignored unsupported non-text WeChat message')
-                        if received_files:
-                            sid = msg.get('from_user_id') or msg.get('session_id') or 'wechat'
-                            session_dir = FILES_DIR / hashlib.sha256(sid.encode()).hexdigest()[:16]
-                            session_dir.mkdir(parents=True, exist_ok=True)
-                            downloaded = []
-                            for file_item in received_files:
-                                name = Path(file_item.get('file_name') or f'wechat-{uuid.uuid4().hex[:8]}.bin').name
-                                target = session_dir / name
-                                try:
-                                    await c.download_file(file_item.get('media') or {}, target)
-                                    downloaded.append((name, target))
-                                except Exception:
-                                    LOG.exception('Failed to download WeChat file')
-                            if downloaded:
-                                paths = '\n'.join(f'- {name}: {path.relative_to(DATA.parent)}' for name, path in downloaded)
-                                await c.send(sid, f'文件已接收并保存到本地：\n{paths}\n\n你可以继续说明要如何处理这些文件。', msg.get('context_token',''))
-                                record(f'wechat:{sid}', 'user', '[文件] ' + ', '.join(name for name, _ in downloaded))
-                            else:
-                                await c.send(sid, '已收到文件，但下载失败，请重新发送。', msg.get('context_token',''))
-                        elif media_types:
-                            sid = msg.get('from_user_id') or msg.get('session_id') or 'wechat'
+                        if media_types:
                             labels = {'image': '图片', 'file': '文件', 'video': '视频'}
                             kinds = '、'.join(labels[k] for k in sorted(media_types))
-                            await c.send(sid, f'已收到{kinds}消息。目前此版本支持文本和语音转写，暂未接入媒体下载、解析和回传。请改发文字说明。', msg.get('context_token',''))
+                            await c.send(sid, f'已收到{kinds}消息。目前此版本支持文本、语音转写和文件处理，图片/视频暂未接入完整解析。请改发文字说明。', context)
                             LOG.info('Sent WeChat media capability notice: %s', ','.join(sorted(media_types)))
                         continue
-                    sid=msg.get('from_user_id') or msg.get('session_id') or 'wechat'
                     lowered = text.strip()
                     if lowered.startswith('发送文件') or lowered.lower().startswith('send file'):
                         raw_path = lowered.split(':', 1)[1].strip() if ':' in lowered else lowered.split(None, 1)[1].strip() if len(lowered.split(None, 1)) > 1 else ''
@@ -238,15 +240,14 @@ async def main():
                         try:
                             candidate.relative_to(CODEX_CWD)
                             if not candidate.is_file(): raise RuntimeError('文件不存在')
-                            await c.send(sid, f'正在发送文件：{candidate.name}', msg.get('context_token',''))
-                            await c.send_file(sid, candidate, msg.get('context_token',''))
+                            await c.send(sid, f'正在发送文件：{candidate.name}', context)
+                            await c.send_file(sid, candidate, context)
                             record(f'wechat:{sid}', 'assistant', f'[文件已发送] {candidate.name}')
                         except Exception as exc:
-                            await c.send(sid, f'发送文件失败：{exc}', msg.get('context_token',''))
+                            await c.send(sid, f'发送文件失败：{exc}', context)
                         continue
                     LOG.info('Forwarding WeChat message to local Codex')
                     record(f'wechat:{sid}', 'user', text)
-                    context = msg.get('context_token','')
                     await c.send(sid, '任务已收到，正在调用本地 Codex。', context)
 
                     async def request_codex():
