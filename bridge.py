@@ -6,6 +6,7 @@ import os
 import secrets
 import json
 import threading
+import sqlite3
 from urllib.parse import parse_qs, urlparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -30,6 +31,10 @@ STATUS_LOCK = threading.Lock()
 STATUS_FILE = Path(os.getenv("CODEX_STATUS_FILE", str(Path(CODEX_CWD) / "data" / "codex_status.json")))
 CODEX_MEMORY_DIR = Path(os.getenv("CODEX_MEMORY_DIR", str(Path.home() / ".codex" / "memories"))).expanduser()
 MEMORY_CONTEXT_CHARS = int(os.getenv("CODEX_MEMORY_CONTEXT_CHARS", "24000"))
+DB_PATH = Path(os.getenv("DB_PATH", str(Path(CODEX_CWD) / "data" / "bot.db")))
+if not DB_PATH.exists() and DB_PATH == Path("/app/data/bot.db"):
+    DB_PATH = Path(CODEX_CWD) / "data" / "bot.db"
+MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "12"))
 
 
 def authorized(headers) -> bool:
@@ -94,6 +99,23 @@ def load_codex_memory_context() -> str:
     if chunks:
         LOGGER.info("Loaded Codex memory context: %d files, %d chars", len(chunks), used)
     return "\n\n".join(chunks)
+
+
+def load_conversation_context(session_id: str) -> str:
+    if not DB_PATH.exists():
+        return ""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        rows = conn.execute(
+            "SELECT role, content FROM messages WHERE session_id=? ORDER BY id DESC LIMIT ?",
+            (session_id, MAX_HISTORY_MESSAGES),
+        ).fetchall()
+        conn.close()
+    except sqlite3.Error:
+        LOGGER.exception("Unable to load conversation history")
+        return ""
+    rows.reverse()
+    return "\n".join(f"{role}: {content}" for role, content in rows if content)
 
 
 async def invoke_codex(prompt: str, session_id: str) -> str:
@@ -207,6 +229,7 @@ class Handler(BaseHTTPRequestHandler):
                 "如果需要修改文件或执行操作，当前请求运行在只读沙箱；请说明限制。"
             )
             memory_context = load_codex_memory_context()
+            conversation_context = load_conversation_context(session_id)
             memory_note = (
                 "以下是本机桌面 Codex 的完整长期记忆内容。回答涉及用户资料或历史记忆的问题时，"
                 "必须先参考这些内容；不要因为当前请求是临时会话就声称没有长期记忆。除非用户明确要求，"
@@ -215,10 +238,16 @@ class Handler(BaseHTTPRequestHandler):
                 if memory_context else
                 "本次未读取到本机 Codex 长期记忆内容，不要虚构已保存的资料。\n\n"
             )
+            conversation_note = (
+                "以下是当前会话的历史消息。请保持上下文连续，除非用户明确要求新开会话，不要把当前问题当成全新对话。\n\n"
+                f"{conversation_context}\n\n"
+                if conversation_context else "当前会话暂无历史消息。\n\n"
+            )
             instruction = (
             "你是通过即时通讯接入的本地 Codex 工作助手。"
             f"请直接回答用户问题；{access_note}\n\n"
             f"{memory_note}"
+            f"{conversation_note}"
             f"会话标识：{session_id}\n用户消息：{prompt}"
             )
             set_status(session_id, "working", "正在启动 Codex")

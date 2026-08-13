@@ -24,7 +24,31 @@ CODEX_CWD = Path(os.getenv('CODEX_CWD', str(Path.cwd()))).resolve()
 FILES_DIR = DATA / 'wechat_files'
 MEDIA_KEY_CACHE = DATA / 'wechat_media_keys.json'
 SCHEDULE_FILE = DATA / 'scheduled_jobs.json'
+SESSION_MAP_FILE = DATA / 'wechat_sessions.json'
 MAX_FILE_BYTES = 50 * 1024 * 1024
+
+def load_session_map():
+    try:
+        value = json.loads(SESSION_MAP_FILE.read_text(encoding='utf-8')) if SESSION_MAP_FILE.exists() else {}
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+def save_session_map(value):
+    temporary = SESSION_MAP_FILE.with_suffix('.tmp')
+    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding='utf-8')
+    temporary.replace(SESSION_MAP_FILE)
+
+def active_session_id(source_id):
+    key = f'wechat:{source_id}'
+    mapping = load_session_map()
+    return str(mapping.get(key) or key)
+
+def start_new_session(source_id):
+    key = f'wechat:{source_id}'
+    session_id = f'{key}:session-{uuid.uuid4().hex[:10]}'
+    mapping = load_session_map(); mapping[key] = session_id; save_session_map(mapping)
+    return session_id
 
 def record(session_id: str, role: str, content: str) -> None:
     conn = sqlite3.connect(DB)
@@ -52,7 +76,7 @@ async def request_codex(session_id, prompt):
         async with session.post(
             CODEX_URL,
             headers={'Authorization': f'Bearer {CODEX_TOKEN}'},
-            json={'session_id': f'wechat:{session_id}', 'prompt': prompt},
+            json={'session_id': session_id, 'prompt': prompt},
         ) as response:
             body = await response.json(content_type=None)
             if response.status >= 400:
@@ -324,7 +348,8 @@ async def main():
                     text = ''.join(text_parts).strip()
                     if has_voice:
                         LOG.info('Received WeChat voice message (transcript=%s)', bool(text))
-                    sid = msg.get('from_user_id') or msg.get('session_id') or 'wechat'
+                    source_id = msg.get('from_user_id') or msg.get('session_id') or 'wechat'
+                    sid = active_session_id(source_id)
                     context = msg.get('context_token','')
                     downloaded_files = []
                     file_failures = []
@@ -368,38 +393,42 @@ async def main():
                             LOG.info('Downloaded %d WeChat file(s) for Codex', len(downloaded_files))
                         else:
                             if file_failures and all(failure == 'key_mismatch' for failure in file_failures):
-                                await c.send(sid, '文件已收到，但微信 CDN 返回的解密密钥与附件不匹配。这是微信文件去重的已知问题。请改变文件内容后重发，例如压缩成 ZIP 并在压缩包内加入一个新的说明.txt；只改文件名无效。', context)
+                                await c.send(source_id, '文件已收到，但微信 CDN 返回的解密密钥与附件不匹配。这是微信文件去重的已知问题。请改变文件内容后重发，例如压缩成 ZIP 并在压缩包内加入一个新的说明.txt；只改文件名无效。', context)
                             else:
-                                await c.send(sid, '已收到文件，但下载失败，请稍后重试。', context)
+                                await c.send(source_id, '已收到文件，但下载失败，请稍后重试。', context)
                             continue
                     if not text:
                         if has_untranscribed_voice:
-                            await c.send(sid, '已收到语音，但当前微信接口未提供语音转写文本，暂时无法识别。请改发文字，或稍后重试。', context)
+                            await c.send(source_id, '已收到语音，但当前微信接口未提供语音转写文本，暂时无法识别。请改发文字，或稍后重试。', context)
                             LOG.info('Sent WeChat voice transcription unavailable notice')
                         else:
                             LOG.info('Ignored unsupported non-text WeChat message')
                         if media_types:
                             labels = {'image': '图片', 'file': '文件', 'video': '视频'}
                             kinds = '、'.join(labels[k] for k in sorted(media_types))
-                            await c.send(sid, f'已收到{kinds}消息，但没有可供下载或解析的媒体参数。请稍后重试或改发文件。', context)
+                            await c.send(source_id, f'已收到{kinds}消息，但没有可供下载或解析的媒体参数。请稍后重试或改发文件。', context)
                             LOG.info('Sent WeChat media capability notice: %s', ','.join(sorted(media_types)))
                         continue
                     lowered = text.strip()
+                    if lowered.lower() in {'/new', '/newsession'} or lowered in {'新开会话', '开始新会话', '新建会话'}:
+                        start_new_session(source_id)
+                        await c.send(source_id, '已新开会话，之前的聊天记录已保留。', context)
+                        continue
                     if lowered.startswith('发送文件') or lowered.lower().startswith('send file'):
                         raw_path = lowered.split(':', 1)[1].strip() if ':' in lowered else lowered.split(None, 1)[1].strip() if len(lowered.split(None, 1)) > 1 else ''
                         candidate = (CODEX_CWD / raw_path).resolve() if not os.path.isabs(raw_path) else Path(raw_path).resolve()
                         try:
                             candidate.relative_to(CODEX_CWD)
                             if not candidate.is_file(): raise RuntimeError('文件不存在')
-                            await c.send(sid, f'正在发送文件：{candidate.name}', context)
-                            await c.send_file(sid, candidate, context)
-                            record(f'wechat:{sid}', 'assistant', f'[文件已发送] {candidate.name}')
+                            await c.send(source_id, f'正在发送文件：{candidate.name}', context)
+                            await c.send_file(source_id, candidate, context)
+                            record(sid, 'assistant', f'[文件已发送] {candidate.name}')
                         except Exception as exc:
-                            await c.send(sid, f'发送文件失败：{exc}', context)
+                            await c.send(source_id, f'发送文件失败：{exc}', context)
                         continue
                     LOG.info('Forwarding WeChat message to local Codex')
-                    record(f'wechat:{sid}', 'user', text)
-                    await c.send(sid, '任务已收到，正在调用本地 Codex。', context)
+                    record(sid, 'user', text)
+                    await c.send(source_id, '任务已收到，正在调用本地 Codex。', context)
 
                     task = asyncio.create_task(request_codex(sid, text))
                     started = asyncio.get_running_loop().time()
@@ -420,16 +449,16 @@ async def main():
                         detail = '正在处理请求'
                         try:
                             async with aiohttp.ClientSession() as status_session:
-                                async with status_session.get(CODEX_STATUS_URL, params={'session_id': f'wechat:{sid}'}, headers={'Authorization': f'Bearer {CODEX_TOKEN}'}, timeout=5) as status_response:
+                                async with status_session.get(CODEX_STATUS_URL, params={'session_id': sid}, headers={'Authorization': f'Bearer {CODEX_TOKEN}'}, timeout=5) as status_response:
                                     if status_response.status < 400:
                                         status = await status_response.json(content_type=None)
                                         detail = status.get('detail') or detail
                         except Exception:
                             pass
-                        await c.send(sid, f'任务仍在处理中，已用时 {elapsed} 秒，当前状态：{detail}。', context)
+                        await c.send(source_id, f'任务仍在处理中，已用时 {elapsed} 秒，当前状态：{detail}。', context)
                     answer = body.get('answer') or '本地 Codex 暂时不可用。'
-                    await c.send(sid, answer, context)
-                    record(f'wechat:{sid}', 'assistant', answer)
+                    await c.send(source_id, answer, context)
+                    record(sid, 'assistant', answer)
                     LOG.info('Sent local Codex reply to WeChat')
             except Exception:
                 LOG.exception('WeChat polling or message processing failed')

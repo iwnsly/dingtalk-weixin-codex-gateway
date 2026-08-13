@@ -6,6 +6,8 @@ import os
 import sqlite3
 import mimetypes
 import hashlib
+import json
+import uuid
 import requests
 from pathlib import Path
 
@@ -41,6 +43,7 @@ DB_PATH = Path(os.getenv("DB_PATH", "/app/data/bot.db"))
 RUNTIME_CONFIG_PATH = Path(os.getenv("RUNTIME_CONFIG_PATH", "/app/data/runtime.json"))
 CODEX_CWD_PATH = Path(os.getenv("CODEX_CWD", str(Path.cwd()))).resolve()
 MEDIA_DIR = DB_PATH.parent / "dingtalk_files"
+SESSION_MAP_FILE = DB_PATH.parent / "dingtalk_sessions.json"
 MAX_MEDIA_BYTES = 50 * 1024 * 1024
 
 
@@ -53,6 +56,33 @@ def runtime_config() -> dict:
     except (OSError, ValueError):
         LOGGER.exception("Failed to read runtime config")
         return {}
+
+
+def load_session_map() -> dict:
+    try:
+        value = json.loads(SESSION_MAP_FILE.read_text(encoding="utf-8")) if SESSION_MAP_FILE.exists() else {}
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_session_map(value: dict) -> None:
+    temporary = SESSION_MAP_FILE.with_suffix(".tmp")
+    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(SESSION_MAP_FILE)
+
+
+def active_session_id(channel: str, source_id: str) -> str:
+    key = f"{channel}:{source_id}"
+    mapping = load_session_map()
+    return str(mapping.get(key) or key)
+
+
+def start_new_session(channel: str, source_id: str) -> str:
+    key = f"{channel}:{source_id}"
+    session_id = f"{key}:session-{uuid.uuid4().hex[:10]}"
+    mapping = load_session_map(); mapping[key] = session_id; save_session_map(mapping)
+    return session_id
 
 
 class ConversationStore:
@@ -203,7 +233,8 @@ class WorkBotHandler(dingtalk_stream.ChatbotHandler):
         raw = callback.data if isinstance(callback.data, dict) else {}
         message = dingtalk_stream.ChatbotMessage.from_dict(callback.data)
         sender_id = str(getattr(message, "sender_staff_id", "") or getattr(message, "sender_id", ""))
-        session_id = str(getattr(message, "conversation_id", "") or sender_id)
+        source_id = str(getattr(message, "conversation_id", "") or sender_id)
+        session_id = active_session_id("dingtalk", source_id)
         message_type = str(raw.get("msgtype") or getattr(message, "message_type", "") or "")
         raw_content = raw.get("content") if isinstance(raw.get("content"), dict) else {}
         download_code = str(raw_content.get("downloadCode") or raw_content.get("download_code") or "").strip()
@@ -256,9 +287,9 @@ class WorkBotHandler(dingtalk_stream.ChatbotHandler):
             self.reply_text("当前账号未被授权使用此机器人。", message)
             return AckMessage.STATUS_OK, "OK"
 
-        if text in {"/reset", "重置会话"}:
-            await STORE.clear(session_id)
-            self.reply_text("会话已重置。", message)
+        if text.lower() in {"/new", "/newsession"} or text in {"新开会话", "开始新会话", "新建会话"}:
+            new_id = start_new_session("dingtalk", source_id)
+            self.reply_text("已新开会话，之前的聊天记录已保留。", message)
             return AckMessage.STATUS_OK, "OK"
 
         if COMMAND_PREFIX:

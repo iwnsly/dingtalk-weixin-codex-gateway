@@ -9,7 +9,7 @@ from datetime import datetime, time, timedelta, timezone
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, urlencode
 
 HOST = os.getenv("ADMIN_HOST", "0.0.0.0")
 PORT = int(os.getenv("ADMIN_PORT", "8080"))
@@ -74,7 +74,7 @@ def logged_in(handler: BaseHTTPRequestHandler) -> bool:
 def page(title: str, body: str) -> str:
     return f"""<!doctype html><html lang=zh-CN><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>{title}</title>
 <style>:root{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#172033;background:#f4f7fb}}*{{box-sizing:border-box}}body{{margin:0}}.shell{{max-width:1180px;margin:0 auto;padding:32px 22px}}.top{{display:flex;justify-content:space-between;align-items:center;margin-bottom:24px}}.brand{{font-size:22px;font-weight:750}}.muted{{color:#667085}}.panel{{background:#fff;border:1px solid #e4e9f0;border-radius:14px;padding:22px;box-shadow:0 8px 28px #12233d0a;margin-bottom:18px}}.grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}}label{{display:block;font-size:13px;font-weight:650;margin-bottom:7px;color:#344054}}input,select{{width:100%;border:1px solid #d0d5dd;border-radius:8px;padding:10px 11px;font:inherit;background:#fff}}button{{border:0;border-radius:8px;background:#1664d9;color:white;padding:10px 16px;font:inherit;font-weight:650;cursor:pointer}}button.secondary{{background:#eef4ff;color:#1555ad}}.tabs{{display:flex;gap:8px;margin-bottom:16px}}.tab{{padding:9px 13px;border-radius:8px;text-decoration:none;color:#475467;background:#f2f4f7}}.tab.active{{background:#1664d9;color:#fff}}table{{width:100%;border-collapse:collapse;font-size:13px}}th,td{{text-align:left;padding:12px 9px;border-bottom:1px solid #eef1f5;vertical-align:top}}th{{color:#667085;font-size:12px}}td.content{{white-space:pre-wrap;max-width:680px;word-break:break-word}}.badge{{display:inline-block;padding:4px 8px;border-radius:999px;font-size:12px;font-weight:650}}.wechat{{background:#e7f8ef;color:#16804b}}.dingtalk{{background:#e8f1ff;color:#1555ad}}.login{{max-width:390px;margin:12vh auto}}img.qr{{width:220px;border-radius:10px;border:1px solid #e4e9f0}}@media(max-width:760px){{.grid{{grid-template-columns:1fr}}.shell{{padding:20px 14px}}table{{font-size:12px}}}}
-</style><style>.task-dot{{display:inline-block;width:9px;height:9px;border-radius:50%;background:#98a2b3;margin-right:7px}}.task-dot.active{{background:#f5a623;box-shadow:0 0 0 4px #fff3d6}}</style><div class=shell>{body}</div></html>"""
+</style><style>.task-dot{{display:inline-block;width:9px;height:9px;border-radius:50%;background:#98a2b3;margin-right:7px}}.task-dot.active{{background:#f5a623;box-shadow:0 0 0 4px #fff3d6}}.filter-label{{font-size:12px;font-weight:700;color:#667085;margin:4px 0 8px}}.selection{{display:inline-block;padding:4px 8px;border-radius:6px;background:#e8f1ff;color:#1555ad;font-size:12px;font-weight:700}}</style><div class=shell>{body}</div></html>"""
 
 
 def login_page(error="") -> str:
@@ -82,8 +82,8 @@ def login_page(error="") -> str:
     return page("登录 - IM 网关", f"<div class='panel login'><div class=brand>本地 Codex IM 网关</div><p class=muted>请输入管理密码</p>{msg}<form method=post action=/login><label>密码<input type=password name=password autofocus></label><button>登录</button></form></div>")
 
 
-def dashboard(c: dict, view: str, channel: str, start: str, end: str) -> str:
-    active_range = "custom"
+def dashboard(c: dict, view: str, channel: str, start: str, end: str, session_id: str = "", range_name: str = "") -> str:
+    active_range = range_name if range_name in {"today", "yesterday", "week", "last_week", "month", "last_month", "year"} else "custom"
     if view == "records" and not start and not end:
         start, end = preset_range("today"); active_range = "today"
     qr_path = DATA / "weixin_qr.json"
@@ -92,21 +92,41 @@ def dashboard(c: dict, view: str, channel: str, start: str, end: str) -> str:
     if qr.get("qr_data") and qr.get("status") in {"waiting", "scaned", "wait"}:
         qr_html += f"<img class=qr src='{html.escape(qr['qr_data'])}' alt='微信登录二维码'>"
     rows = []
+    sessions = []
     db = DATA / "bot.db"
     if db.exists():
         conn = sqlite3.connect(db)
-        query = "SELECT created_at, platform, role, session_id, content FROM messages WHERE platform=?"
-        args = [channel]
-        if start: query += " AND created_at >= ?"; args.append(start.replace("T", " "))
-        if end: query += " AND created_at <= ?"; args.append(end.replace("T", " "))
-        query += " ORDER BY id DESC LIMIT 500"
-        for created, platform, role, session_id, content in conn.execute(query, args):
-            rows.append(f"<tr><td>{html.escape(created)}</td><td><span class='badge {platform}'>{'微信' if platform == 'wechat' else '钉钉'}</span></td><td>{'用户' if role == 'user' else '助手'}</td><td>{html.escape(session_id[:28])}</td><td class=content>{html.escape(content)}</td></tr>")
+        if session_id:
+            query = "SELECT created_at, platform, role, session_id, content FROM messages WHERE platform=?"
+            args = [channel]
+            if start: query += " AND created_at >= ?"; args.append(start.replace("T", " "))
+            if end: query += " AND created_at <= ?"; args.append(end.replace("T", " "))
+            query += " AND session_id=? ORDER BY id DESC LIMIT 500"; args.append(session_id)
+            for created, platform, role, record_session_id, content in conn.execute(query, args):
+                rows.append(f"<tr><td>{html.escape(created)}</td><td><span class='badge {platform}'>{'微信' if platform == 'wechat' else '钉钉'}</span></td><td>{'用户' if role == 'user' else '助手'}</td><td>{html.escape(record_session_id[:28])}</td><td class=content>{html.escape(content)}</td></tr>")
         conn.close()
+        if not session_id:
+            conn = sqlite3.connect(db)
+            query = """SELECT m.session_id, MIN(m.created_at), MAX(m.created_at), COUNT(*),
+                COALESCE(
+                    (SELECT content FROM messages u WHERE u.session_id=m.session_id AND u.platform=m.platform AND u.role='user' ORDER BY u.id LIMIT 1),
+                    (SELECT content FROM messages f WHERE f.session_id=m.session_id AND f.platform=m.platform ORDER BY f.id LIMIT 1)
+                )
+                FROM messages m WHERE m.platform=?"""
+            args = [channel]
+            if start: query += " AND created_at >= ?"; args.append(start.replace("T", " "))
+            if end: query += " AND created_at <= ?"; args.append(end.replace("T", " "))
+            query += " GROUP BY m.session_id ORDER BY MAX(m.created_at) DESC"
+            for sid, first_seen, last_seen, count, title in conn.execute(query, args):
+                title = str(title or "（无标题消息）").strip()
+                short_title = title if len(title) <= 48 else title[:48] + "…"
+                params = urlencode({"view": "records", "channel": channel, "range": "custom", "start": start, "end": end, "session": sid})
+                sessions.append(f"<tr><td><a title='{html.escape(title, quote=True)}' href='/?{params}'>{html.escape(short_title)}</a><div class=muted style='font-size:11px;margin-top:4px'>{html.escape(sid[:42])}</div></td><td>{html.escape(first_seen or '')}</td><td>{html.escape(last_seen or '')}</td><td>{count}</td></tr>")
+            conn.close()
     table = "".join(rows) or "<tr><td colspan=5 class=muted>当前筛选暂无记录</td></tr>"
     selected_d = "selected" if channel == "dingtalk" else ""; selected_w = "selected" if channel == "wechat" else ""
     body = f"<div class=top><div><div class=brand>本地 Codex IM 网关</div><div class=muted>渠道配置与对话审计</div></div><a class=tab href=/logout>退出</a></div>"
-    body += f"<div class=tabs><a class='tab {'active' if view == 'config' else ''}' href='/?view=config'>配置</a><a class='tab {'active' if view == 'records' else ''}' href='/?view=records&channel={channel}'>聊天记录</a></div>"
+    body += f"<div class=tabs><a class='tab {'active' if view == 'records' else ''}' href='/?view=records&channel={channel}'>聊天记录</a><a class='tab {'active' if view == 'config' else ''}' href='/?view=config'>配置</a></div>"
     if view == "config":
         full_access = bool(c.get("full_access", False))
         checked = "checked" if full_access else ""
@@ -117,7 +137,16 @@ def dashboard(c: dict, view: str, channel: str, start: str, end: str) -> str:
     else:
         presets = [("today", "今天"), ("yesterday", "昨天"), ("week", "本周"), ("last_week", "上周"), ("month", "本月"), ("last_month", "上月"), ("year", "本年度")]
         preset_links = "".join(f"<a class='tab {'active' if active_range == key else ''}' href='/?view=records&channel={channel}&range={key}'>{label}</a>" for key, label in presets)
-        body += f"<div class=panel><div class=top><h2>聊天记录</h2><span class=muted>{len(rows)} 条</span></div><div class=tabs><a class='tab {'active' if channel == 'dingtalk' else ''}' href='/?view=records&channel=dingtalk&range=today'>钉钉</a><a class='tab {'active' if channel == 'wechat' else ''}' href='/?view=records&channel=wechat&range=today'>微信</a></div><div class=tabs style='flex-wrap:wrap'>{preset_links}</div><form method=get class=grid><input type=hidden name=view value=records><input type=hidden name=channel value='{channel}'><div><label>开始时间</label><input type=datetime-local name=start value='{html.escape(start.replace(' ', 'T')[:16])}'></div><div><label>结束时间</label><input type=datetime-local name=end value='{html.escape(end.replace(' ', 'T')[:16])}'></div><div><button class=secondary>筛选记录</button></div></form><div style='overflow:auto;margin-top:16px'><table><thead><tr><th>时间</th><th>渠道</th><th>角色</th><th>会话</th><th>消息</th></tr></thead><tbody>{table}</tbody></table></div></div>"
+        session_panel = ""
+        if not session_id:
+            session_table = "".join(sessions) or "<tr><td colspan=4 class=muted>当前筛选暂无会话</td></tr>"
+            session_panel = f"<div class=panel><div class=top><h2>按会话查看</h2><span class=muted>{len(sessions)} 个会话</span></div><div style='overflow:auto'><table><thead><tr><th>会话标题</th><th>开始时间</th><th>最后活动</th><th>消息数</th></tr></thead><tbody>{session_table}</tbody></table></div></div>"
+        else:
+            return_params = urlencode({"view": "records", "channel": channel, "range": active_range if active_range != "custom" else "today"})
+            session_panel = f"<p><a class=tab href='/?{return_params}'>返回会话列表</a> <span class=muted>当前会话：{html.escape(session_id)}</span></p>"
+        selected_label = '自定义时间' if active_range == 'custom' and (start or end) else dict(presets).get(active_range, '今天')
+        detail_table = f"<div style='overflow:auto;margin-top:16px'><table><thead><tr><th>时间</th><th>渠道</th><th>角色</th><th>会话</th><th>消息</th></tr></thead><tbody>{table}</tbody></table></div>" if session_id else ""
+        body += f"<div class=panel><div class=top><h2>聊天记录</h2><span class=selection>{'会话明细' if session_id else '会话分组'} · {selected_label}</span></div><div class=filter-label>渠道筛选</div><div class=tabs><a class='tab {'active' if channel == 'dingtalk' else ''}' href='/?view=records&channel=dingtalk&range=today'>钉钉</a><a class='tab {'active' if channel == 'wechat' else ''}' href='/?view=records&channel=wechat&range=today'>微信</a></div><div class=filter-label>时间筛选</div><div class=tabs style='flex-wrap:wrap'>{preset_links}</div><form method=get class=grid><input type=hidden name=view value=records><input type=hidden name=channel value='{channel}'><input type=hidden name=session value='{html.escape(session_id)}'><div><label>开始时间</label><input type=datetime-local name=start value='{html.escape(start.replace(' ', 'T')[:16])}'></div><div><label>结束时间</label><input type=datetime-local name=end value='{html.escape(end.replace(' ', 'T')[:16])}'></div><div><button class=secondary>筛选记录</button></div></form>{session_panel}{detail_table}</div>"
     task_rows = []
     for item in load_statuses():
         active = item.get("status") in {"working", "finalizing"}
@@ -147,9 +176,10 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/logout": SESSIONS.discard(self.sid()); self.respond("", 303, {"Location":"/login", "Set-Cookie":"sid=; Max-Age=0; Path=/"}); return
         if parsed.path == "/login": self.respond(login_page()); return
         if not logged_in(self): self.respond(login_page(), 401); return
-        q = parse_qs(parsed.query); view = q.get("view", ["config"])[0]; start = q.get("start", [""])[0]; end = q.get("end", [""])[0]
-        if view == "records" and q.get("range", [""])[0]: start, end = preset_range(q["range"][0])
-        self.respond(dashboard(load_config(), view, q.get("channel", [load_config().get("channel", "dingtalk")])[0], start, end))
+        q = parse_qs(parsed.query); view = q.get("view", ["records"])[0]; start = q.get("start", [""])[0]; end = q.get("end", [""])[0]
+        range_name = q.get("range", [""])[0]
+        if view == "records" and range_name in {"today", "yesterday", "week", "last_week", "month", "last_month", "year"}: start, end = preset_range(range_name)
+        self.respond(dashboard(load_config(), view, q.get("channel", [load_config().get("channel", "dingtalk")])[0], start, end, q.get("session", [""])[0], range_name))
 
     def sid(self):
         cookie = SimpleCookie(self.headers.get("Cookie", "")); return cookie.get("sid").value if cookie.get("sid") else ""
