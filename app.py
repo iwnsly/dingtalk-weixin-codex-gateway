@@ -51,11 +51,19 @@ def runtime_config() -> dict:
     if not RUNTIME_CONFIG_PATH.exists():
         return {}
     try:
-        import json
-        return json.loads(RUNTIME_CONFIG_PATH.read_text())
+        return json.loads(RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         LOGGER.exception("Failed to read runtime config")
         return {}
+
+
+def ensure_sessions_table() -> None:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("CREATE TABLE IF NOT EXISTS sessions (session_id TEXT PRIMARY KEY, channel TEXT NOT NULL, source_id TEXT NOT NULL, title TEXT NOT NULL DEFAULT '', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, last_active_at DATETIME DEFAULT CURRENT_TIMESTAMP)")
+    conn.execute("DROP INDEX IF EXISTS idx_sessions_source")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_source_active ON sessions(channel, source_id, last_active_at)")
+    conn.commit(); conn.close()
 
 
 def load_session_map() -> dict:
@@ -74,13 +82,22 @@ def save_session_map(value: dict) -> None:
 
 def active_session_id(channel: str, source_id: str) -> str:
     key = f"{channel}:{source_id}"
-    mapping = load_session_map()
-    return str(mapping.get(key) or key)
+    ensure_sessions_table()
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute("SELECT session_id FROM sessions WHERE channel=? AND source_id=? ORDER BY last_active_at DESC LIMIT 1", (channel, source_id)).fetchone()
+    if row:
+        conn.execute("UPDATE sessions SET last_active_at=CURRENT_TIMESTAMP WHERE session_id=?", (row[0],)); conn.commit(); conn.close(); return str(row[0])
+    mapping = load_session_map(); session_id = str(mapping.get(key) or key)
+    conn.execute("INSERT OR IGNORE INTO sessions(session_id, channel, source_id) VALUES (?, ?, ?)", (session_id, channel, source_id)); conn.commit(); conn.close()
+    return session_id
 
 
 def start_new_session(channel: str, source_id: str) -> str:
+    ensure_sessions_table()
     key = f"{channel}:{source_id}"
     session_id = f"{key}:session-{uuid.uuid4().hex[:10]}"
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("INSERT INTO sessions(session_id, channel, source_id) VALUES (?, ?, ?)", (session_id, channel, source_id)); conn.commit(); conn.close()
     mapping = load_session_map(); mapping[key] = session_id; save_session_map(mapping)
     return session_id
 
@@ -94,6 +111,7 @@ class ConversationStore:
             "id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, "
             "role TEXT NOT NULL, content TEXT NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)"
         )
+        self.conn.execute("CREATE TABLE IF NOT EXISTS sessions (session_id TEXT PRIMARY KEY, channel TEXT NOT NULL, source_id TEXT NOT NULL, title TEXT NOT NULL DEFAULT '', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, last_active_at DATETIME DEFAULT CURRENT_TIMESTAMP)")
         columns = {row[1] for row in self.conn.execute("PRAGMA table_info(messages)")}
         if "platform" not in columns:
             self.conn.execute("ALTER TABLE messages ADD COLUMN platform TEXT NOT NULL DEFAULT 'dingtalk'")
@@ -114,6 +132,13 @@ class ConversationStore:
                 "INSERT INTO messages(session_id, role, content, platform) VALUES (?, ?, ?, ?)",
                 (session_id, role, content, platform),
             )
+            if role == "user":
+                self.conn.execute(
+                    "UPDATE sessions SET last_active_at=CURRENT_TIMESTAMP, title=CASE WHEN title='' THEN ? ELSE title END WHERE session_id=?",
+                    (content[:120], session_id),
+                )
+            else:
+                self.conn.execute("UPDATE sessions SET last_active_at=CURRENT_TIMESTAMP WHERE session_id=?", (session_id,))
             self.conn.commit()
 
     async def clear(self, session_id: str) -> None:

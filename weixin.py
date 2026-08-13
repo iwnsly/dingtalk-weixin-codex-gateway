@@ -27,6 +27,12 @@ SCHEDULE_FILE = DATA / 'scheduled_jobs.json'
 SESSION_MAP_FILE = DATA / 'wechat_sessions.json'
 MAX_FILE_BYTES = 50 * 1024 * 1024
 
+def ensure_sessions_table():
+    DB.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB)
+    conn.execute("CREATE TABLE IF NOT EXISTS sessions (session_id TEXT PRIMARY KEY, channel TEXT NOT NULL, source_id TEXT NOT NULL, title TEXT NOT NULL DEFAULT '', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, last_active_at DATETIME DEFAULT CURRENT_TIMESTAMP)")
+    conn.commit(); conn.close()
+
 def load_session_map():
     try:
         value = json.loads(SESSION_MAP_FILE.read_text(encoding='utf-8')) if SESSION_MAP_FILE.exists() else {}
@@ -40,22 +46,35 @@ def save_session_map(value):
     temporary.replace(SESSION_MAP_FILE)
 
 def active_session_id(source_id):
+    ensure_sessions_table()
     key = f'wechat:{source_id}'
-    mapping = load_session_map()
-    return str(mapping.get(key) or key)
+    conn = sqlite3.connect(DB)
+    row = conn.execute("SELECT session_id FROM sessions WHERE channel='wechat' AND source_id=? ORDER BY last_active_at DESC LIMIT 1", (source_id,)).fetchone()
+    if row:
+        conn.execute("UPDATE sessions SET last_active_at=CURRENT_TIMESTAMP WHERE session_id=?", (row[0],)); conn.commit(); conn.close(); return str(row[0])
+    mapping = load_session_map(); session_id = str(mapping.get(key) or key)
+    conn.execute("INSERT OR IGNORE INTO sessions(session_id, channel, source_id) VALUES (?, 'wechat', ?)", (session_id, source_id)); conn.commit(); conn.close()
+    return session_id
 
 def start_new_session(source_id):
+    ensure_sessions_table()
     key = f'wechat:{source_id}'
     session_id = f'{key}:session-{uuid.uuid4().hex[:10]}'
+    conn = sqlite3.connect(DB); conn.execute("INSERT INTO sessions(session_id, channel, source_id) VALUES (?, 'wechat', ?)", (session_id, source_id)); conn.commit(); conn.close()
     mapping = load_session_map(); mapping[key] = session_id; save_session_map(mapping)
     return session_id
 
 def record(session_id: str, role: str, content: str) -> None:
     conn = sqlite3.connect(DB)
+    conn.execute("CREATE TABLE IF NOT EXISTS sessions (session_id TEXT PRIMARY KEY, channel TEXT NOT NULL, source_id TEXT NOT NULL, title TEXT NOT NULL DEFAULT '', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, last_active_at DATETIME DEFAULT CURRENT_TIMESTAMP)")
     conn.execute("CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, platform TEXT NOT NULL DEFAULT 'dingtalk')")
     columns = {row[1] for row in conn.execute('PRAGMA table_info(messages)')}
     if 'platform' not in columns: conn.execute("ALTER TABLE messages ADD COLUMN platform TEXT NOT NULL DEFAULT 'dingtalk'")
     conn.execute('INSERT INTO messages(session_id, role, content, platform) VALUES (?, ?, ?, ?)', (session_id, role, content, 'wechat'))
+    if role == 'user':
+        conn.execute("UPDATE sessions SET last_active_at=CURRENT_TIMESTAMP, title=CASE WHEN title='' THEN ? ELSE title END WHERE session_id=?", (content[:120], session_id))
+    else:
+        conn.execute("UPDATE sessions SET last_active_at=CURRENT_TIMESTAMP WHERE session_id=?", (session_id,))
     conn.commit(); conn.close()
 
 def load_scheduled_jobs():
@@ -104,17 +123,18 @@ async def run_scheduled_jobs(client):
                     continue
                 if job.get('last_sent_date') == today:
                     continue
-                session_id = job.get('session_id', '').removeprefix('wechat:')
-                if not session_id:
+                source_id = job.get('session_id', '').removeprefix('wechat:')
+                if not source_id:
                     LOG.error('Scheduled job %s has no session_id', job.get('id'))
                     continue
+                session_id = active_session_id(source_id)
                 LOG.info('Running scheduled job %s for %s', job.get('id'), session_id)
                 body = await request_codex(session_id, fortune_prompt(job, today))
                 answer = body.get('answer') or ''
                 if not answer:
                     raise RuntimeError('Codex returned an empty scheduled response')
-                await client.send(session_id, answer)
-                record(f'wechat:{session_id}', 'assistant', answer)
+                await client.send(source_id, answer)
+                record(session_id, 'assistant', answer)
                 job['last_sent_date'] = today
                 job['last_sent_at'] = now.isoformat()
                 save_scheduled_jobs(jobs)
@@ -440,9 +460,9 @@ async def main():
                             except Exception:
                                 error_text = str(task.exception() or '') if task.done() else ''
                                 if '上游模型服务返回 502' in error_text:
-                                    await c.send(sid, '任务已送达，但本地 Codex 当前连接的上游模型服务返回 502，暂时无法生成回复。请稍后重试，或检查 ~/.codex/config.toml 的自定义 Provider 地址。', context)
+                                    await c.send(source_id, '任务已送达，但本地 Codex 当前连接的上游模型服务返回 502，暂时无法生成回复。请稍后重试，或检查 ~/.codex/config.toml 的自定义 Provider 地址。', context)
                                 else:
-                                    await c.send(sid, '任务处理失败，请检查本地 Codex Bridge 状态后重试。', context)
+                                    await c.send(source_id, '任务处理失败，请检查本地 Codex Bridge 状态后重试。', context)
                                 raise
                             break
                         elapsed = int(asyncio.get_running_loop().time() - started)

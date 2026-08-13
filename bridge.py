@@ -7,6 +7,7 @@ import secrets
 import json
 import threading
 import sqlite3
+import subprocess
 from urllib.parse import parse_qs, urlparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -25,7 +26,7 @@ CODEX_BIN = os.getenv("CODEX_BIN", "/Applications/ChatGPT.app/Contents/Resources
 CODEX_CWD = os.getenv("CODEX_CWD", str(Path.cwd()))
 RUNTIME_CONFIG_PATH = Path(os.getenv("CODEX_RUNTIME_CONFIG_PATH", str(Path(CODEX_CWD) / "data" / "runtime.json")))
 TIMEOUT = int(os.getenv("CODEX_BRIDGE_TIMEOUT_SECONDS", "180"))
-MAX_INPUT = int(os.getenv("MAX_INPUT_CHARS", "6000"))
+MAX_INPUT = int(os.getenv("MAX_INPUT_CHARS", "5000"))
 STATUSES: dict[str, dict] = {}
 STATUS_LOCK = threading.Lock()
 STATUS_FILE = Path(os.getenv("CODEX_STATUS_FILE", str(Path(CODEX_CWD) / "data" / "codex_status.json")))
@@ -34,7 +35,9 @@ MEMORY_CONTEXT_CHARS = int(os.getenv("CODEX_MEMORY_CONTEXT_CHARS", "24000"))
 DB_PATH = Path(os.getenv("DB_PATH", str(Path(CODEX_CWD) / "data" / "bot.db")))
 if not DB_PATH.exists() and DB_PATH == Path("/app/data/bot.db"):
     DB_PATH = Path(CODEX_CWD) / "data" / "bot.db"
-MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "12"))
+MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "32"))
+CONTEXT_SUMMARY_THRESHOLD = int(os.getenv("CONTEXT_SUMMARY_THRESHOLD", "10000"))
+SUMMARY_MAX_CHARS = int(os.getenv("SUMMARY_MAX_CHARS", "2500"))
 
 
 def authorized(headers) -> bool:
@@ -50,6 +53,22 @@ def full_access_enabled() -> bool:
     except (OSError, ValueError):
         LOGGER.warning("Unable to read runtime permission config; using read-only mode")
     return False
+
+
+def runtime_limits() -> tuple[int, int, int, int]:
+    values = (MAX_HISTORY_MESSAGES, CONTEXT_SUMMARY_THRESHOLD, MAX_INPUT, SUMMARY_MAX_CHARS)
+    try:
+        if RUNTIME_CONFIG_PATH.exists():
+            config = json.loads(RUNTIME_CONFIG_PATH.read_text())
+            return (
+                max(1, int(config.get("max_history_messages", values[0]))),
+                max(1000, int(config.get("context_summary_threshold", values[1]))),
+                max(500, int(config.get("max_message_chars", values[2]))),
+                max(500, int(config.get("summary_max_chars", values[3]))),
+            )
+    except (OSError, ValueError, TypeError):
+        LOGGER.warning("Unable to read conversation limit configuration")
+    return values
 
 
 def set_status(session_id: str, status: str, detail: str = "") -> None:
@@ -101,21 +120,68 @@ def load_codex_memory_context() -> str:
     return "\n\n".join(chunks)
 
 
-def load_conversation_context(session_id: str) -> str:
+def load_conversation_context(session_id: str, max_messages: int) -> tuple[str, str, str, int, int]:
     if not DB_PATH.exists():
-        return ""
+        return "", "", "", 0, 0
     try:
         conn = sqlite3.connect(DB_PATH)
         rows = conn.execute(
             "SELECT role, content FROM messages WHERE session_id=? ORDER BY id DESC LIMIT ?",
-            (session_id, MAX_HISTORY_MESSAGES),
+            (session_id, max_messages),
         ).fetchall()
+        try:
+            summary_row = conn.execute("SELECT summary, source_count FROM conversation_summaries WHERE session_id=?", (session_id,)).fetchone()
+        except sqlite3.OperationalError:
+            summary_row = None
+        total_count = conn.execute("SELECT COUNT(*) FROM messages WHERE session_id=?", (session_id,)).fetchone()[0]
+        source_count = int((summary_row or ("", 0))[1] or 0)
+        pending_rows = conn.execute("SELECT role, content FROM messages WHERE session_id=? ORDER BY id ASC LIMIT -1 OFFSET ?", (session_id, source_count)).fetchall()
         conn.close()
     except sqlite3.Error:
         LOGGER.exception("Unable to load conversation history")
-        return ""
+        return "", "", "", 0, 0
     rows.reverse()
-    return "\n".join(f"{role}: {content}" for role, content in rows if content)
+    summary, source_count = summary_row or ("", 0)
+    recent = "\n".join(f"{role}: {content}" for role, content in rows if content)
+    pending = "\n".join(f"{role}: {content}" for role, content in pending_rows if content)
+    return recent, pending, summary, int(source_count or 0), int(total_count or 0)
+
+
+def save_conversation_summary(session_id: str, summary: str, source_count: int) -> None:
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("CREATE TABLE IF NOT EXISTS conversation_summaries (session_id TEXT PRIMARY KEY, summary TEXT NOT NULL, source_count INTEGER NOT NULL DEFAULT 0, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)")
+    conn.execute("INSERT INTO conversation_summaries(session_id, summary, source_count, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP) ON CONFLICT(session_id) DO UPDATE SET summary=excluded.summary, source_count=excluded.source_count, updated_at=CURRENT_TIMESTAMP", (session_id, summary, source_count))
+    conn.commit(); conn.close()
+
+
+def build_summary_prompt(session_id: str, existing_summary: str, history: str) -> str:
+    return (
+        "你是会话摘要器。请将以下即时通讯会话压缩成可供后续助手继续工作的中文摘要。"
+        "保留用户目标、已确认事实、关键决定、待办事项、文件路径和未解决问题；删除寒暄和重复内容。"
+        "不要编造信息，控制在 2000 字以内，只输出摘要正文。\n\n"
+        f"会话：{session_id}\n已有摘要：\n{existing_summary or '无'}\n新增消息：\n{history}"
+    )
+
+
+def invoke_codex_sync_summary(session_id: str, existing_summary: str, history: str) -> str:
+    full_access = full_access_enabled()
+    sandbox = "danger-full-access" if full_access else "read-only"
+    proc = subprocess.run(
+        [CODEX_BIN, "exec", "--ephemeral", "--skip-git-repo-check", "-s", sandbox, "--color", "never", "--json", build_summary_prompt(session_id, existing_summary, history)],
+        cwd=CODEX_CWD, capture_output=True, text=True, timeout=min(TIMEOUT, 120), check=False,
+    )
+    if proc.returncode:
+        raise RuntimeError(proc.stderr.strip()[-500:] or f"summary exit {proc.returncode}")
+    answer = ""
+    for line in proc.stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        item = event.get("item") or {}
+        if event.get("type") == "item.completed" and item.get("type") == "agent_message":
+            answer = str(item.get("text") or "").strip()
+    return answer[:3000]
 
 
 async def invoke_codex(prompt: str, session_id: str) -> str:
@@ -218,9 +284,11 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(length))
             prompt = str(body.get("prompt", "")).strip()
             session_id = str(body.get("session_id", "")).strip()
-            if not prompt or len(prompt) > MAX_INPUT:
+            max_messages, summary_threshold, max_message_chars, summary_max_chars = runtime_limits()
+            if not prompt:
                 self._json({"error": "invalid prompt"}, 400)
                 return
+            prompt = prompt[:max_message_chars]
             if not session_id:
                 session_id = "default"
             access_note = (
@@ -229,7 +297,16 @@ class Handler(BaseHTTPRequestHandler):
                 "如果需要修改文件或执行操作，当前请求运行在只读沙箱；请说明限制。"
             )
             memory_context = load_codex_memory_context()
-            conversation_context = load_conversation_context(session_id)
+            conversation_context, pending_context, conversation_summary, summary_source_count, total_count = load_conversation_context(session_id, max_messages)
+            if len(pending_context) > summary_threshold and total_count > summary_source_count:
+                try:
+                    summary = invoke_codex_sync_summary(session_id, conversation_summary, pending_context)
+                    if summary:
+                        save_conversation_summary(session_id, summary, total_count)
+                        conversation_summary = summary[:summary_max_chars]
+                except Exception:
+                    LOGGER.exception("Unable to summarize conversation; using truncated history")
+            conversation_context = conversation_context[-summary_threshold:]
             memory_note = (
                 "以下是本机桌面 Codex 的完整长期记忆内容。回答涉及用户资料或历史记忆的问题时，"
                 "必须先参考这些内容；不要因为当前请求是临时会话就声称没有长期记忆。除非用户明确要求，"
@@ -240,8 +317,9 @@ class Handler(BaseHTTPRequestHandler):
             )
             conversation_note = (
                 "以下是当前会话的历史消息。请保持上下文连续，除非用户明确要求新开会话，不要把当前问题当成全新对话。\n\n"
+                f"会话摘要：{conversation_summary}\n\n"
                 f"{conversation_context}\n\n"
-                if conversation_context else "当前会话暂无历史消息。\n\n"
+                if conversation_context or conversation_summary else "当前会话暂无历史消息。\n\n"
             )
             instruction = (
             "你是通过即时通讯接入的本地 Codex 工作助手。"
