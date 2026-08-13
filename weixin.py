@@ -30,7 +30,8 @@ MAX_FILE_BYTES = 50 * 1024 * 1024
 def ensure_sessions_table():
     DB.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB)
-    conn.execute("CREATE TABLE IF NOT EXISTS sessions (session_id TEXT PRIMARY KEY, channel TEXT NOT NULL, source_id TEXT NOT NULL, title TEXT NOT NULL DEFAULT '', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, last_active_at DATETIME DEFAULT CURRENT_TIMESTAMP)")
+    conn.execute("CREATE TABLE IF NOT EXISTS sessions (session_id TEXT PRIMARY KEY, channel TEXT NOT NULL, source_id TEXT NOT NULL, title TEXT NOT NULL DEFAULT '', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, last_active_at DATETIME DEFAULT CURRENT_TIMESTAMP, archived_at DATETIME)")
+    if 'archived_at' not in {row[1] for row in conn.execute('PRAGMA table_info(sessions)')}: conn.execute('ALTER TABLE sessions ADD COLUMN archived_at DATETIME')
     conn.commit(); conn.close()
 
 def load_session_map():
@@ -49,7 +50,7 @@ def active_session_id(source_id):
     ensure_sessions_table()
     key = f'wechat:{source_id}'
     conn = sqlite3.connect(DB)
-    row = conn.execute("SELECT session_id FROM sessions WHERE channel='wechat' AND source_id=? ORDER BY last_active_at DESC LIMIT 1", (source_id,)).fetchone()
+    row = conn.execute("SELECT session_id FROM sessions WHERE channel='wechat' AND source_id=? AND archived_at IS NULL ORDER BY last_active_at DESC LIMIT 1", (source_id,)).fetchone()
     if row:
         conn.execute("UPDATE sessions SET last_active_at=CURRENT_TIMESTAMP WHERE session_id=?", (row[0],)); conn.commit(); conn.close(); return str(row[0])
     mapping = load_session_map(); session_id = str(mapping.get(key) or key)
@@ -61,12 +62,12 @@ def start_new_session(source_id):
     key = f'wechat:{source_id}'
     session_id = f'{key}:session-{uuid.uuid4().hex[:10]}'
     conn = sqlite3.connect(DB); conn.execute("INSERT INTO sessions(session_id, channel, source_id) VALUES (?, 'wechat', ?)", (session_id, source_id)); conn.commit(); conn.close()
-    mapping = load_session_map(); mapping[key] = session_id; save_session_map(mapping)
     return session_id
 
 def record(session_id: str, role: str, content: str) -> None:
     conn = sqlite3.connect(DB)
-    conn.execute("CREATE TABLE IF NOT EXISTS sessions (session_id TEXT PRIMARY KEY, channel TEXT NOT NULL, source_id TEXT NOT NULL, title TEXT NOT NULL DEFAULT '', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, last_active_at DATETIME DEFAULT CURRENT_TIMESTAMP)")
+    conn.execute("CREATE TABLE IF NOT EXISTS sessions (session_id TEXT PRIMARY KEY, channel TEXT NOT NULL, source_id TEXT NOT NULL, title TEXT NOT NULL DEFAULT '', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, last_active_at DATETIME DEFAULT CURRENT_TIMESTAMP, archived_at DATETIME)")
+    conn.execute("CREATE TABLE IF NOT EXISTS files (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, path TEXT NOT NULL, name TEXT NOT NULL, sha256 TEXT NOT NULL, mime_type TEXT, size_bytes INTEGER NOT NULL, parse_status TEXT NOT NULL DEFAULT 'received', created_at DATETIME DEFAULT CURRENT_TIMESTAMP)")
     conn.execute("CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, platform TEXT NOT NULL DEFAULT 'dingtalk')")
     columns = {row[1] for row in conn.execute('PRAGMA table_info(messages)')}
     if 'platform' not in columns: conn.execute("ALTER TABLE messages ADD COLUMN platform TEXT NOT NULL DEFAULT 'dingtalk'")
@@ -75,6 +76,14 @@ def record(session_id: str, role: str, content: str) -> None:
         conn.execute("UPDATE sessions SET last_active_at=CURRENT_TIMESTAMP, title=CASE WHEN title='' THEN ? ELSE title END WHERE session_id=?", (content[:120], session_id))
     else:
         conn.execute("UPDATE sessions SET last_active_at=CURRENT_TIMESTAMP WHERE session_id=?", (session_id,))
+    conn.commit(); conn.close()
+
+def record_file(session_id: str, path: Path, status: str = 'received') -> None:
+    conn = sqlite3.connect(DB)
+    conn.execute("CREATE TABLE IF NOT EXISTS files (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, path TEXT NOT NULL, name TEXT NOT NULL, sha256 TEXT NOT NULL, mime_type TEXT, size_bytes INTEGER NOT NULL, parse_status TEXT NOT NULL DEFAULT 'received', created_at DATETIME DEFAULT CURRENT_TIMESTAMP)")
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    import mimetypes
+    conn.execute("INSERT INTO files(session_id,path,name,sha256,mime_type,size_bytes,parse_status) VALUES (?,?,?,?,?,?,?)", (session_id, str(path), path.name, digest, mimetypes.guess_type(path.name)[0], path.stat().st_size, status))
     conn.commit(); conn.close()
 
 def load_scheduled_jobs():
@@ -90,12 +99,12 @@ def save_scheduled_jobs(jobs):
     temporary.write_text(json.dumps(jobs, ensure_ascii=False, indent=2), encoding='utf-8')
     temporary.replace(SCHEDULE_FILE)
 
-async def request_codex(session_id, prompt):
+async def request_codex(session_id, prompt, actor_id=''):
     async with aiohttp.ClientSession() as session:
         async with session.post(
             CODEX_URL,
             headers={'Authorization': f'Bearer {CODEX_TOKEN}'},
-            json={'session_id': session_id, 'prompt': prompt},
+            json={'session_id': session_id, 'prompt': prompt, 'actor_id': actor_id},
         ) as response:
             body = await response.json(content_type=None)
             if response.status >= 400:
@@ -393,6 +402,7 @@ async def main():
                                     file_item.get('md5', ''),
                                     expected_size,
                                 )
+                                record_file(sid, target)
                                 downloaded_files.append((label, name, target))
                             except RuntimeError as exc:
                                 if str(exc) == 'WECHAT_CDN_KEY_MISMATCH':
@@ -450,7 +460,7 @@ async def main():
                     record(sid, 'user', text)
                     await c.send(source_id, '任务已收到，正在调用本地 Codex。', context)
 
-                    task = asyncio.create_task(request_codex(sid, text))
+                    task = asyncio.create_task(request_codex(sid, text, source_id))
                     started = asyncio.get_running_loop().time()
                     while True:
                         done, _ = await asyncio.wait({task}, timeout=PROGRESS_INTERVAL)

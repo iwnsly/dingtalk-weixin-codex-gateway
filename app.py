@@ -60,7 +60,8 @@ def runtime_config() -> dict:
 def ensure_sessions_table() -> None:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
-    conn.execute("CREATE TABLE IF NOT EXISTS sessions (session_id TEXT PRIMARY KEY, channel TEXT NOT NULL, source_id TEXT NOT NULL, title TEXT NOT NULL DEFAULT '', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, last_active_at DATETIME DEFAULT CURRENT_TIMESTAMP)")
+    conn.execute("CREATE TABLE IF NOT EXISTS sessions (session_id TEXT PRIMARY KEY, channel TEXT NOT NULL, source_id TEXT NOT NULL, title TEXT NOT NULL DEFAULT '', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, last_active_at DATETIME DEFAULT CURRENT_TIMESTAMP, archived_at DATETIME)")
+    if "archived_at" not in {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}: conn.execute("ALTER TABLE sessions ADD COLUMN archived_at DATETIME")
     conn.execute("DROP INDEX IF EXISTS idx_sessions_source")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_source_active ON sessions(channel, source_id, last_active_at)")
     conn.commit(); conn.close()
@@ -84,7 +85,7 @@ def active_session_id(channel: str, source_id: str) -> str:
     key = f"{channel}:{source_id}"
     ensure_sessions_table()
     conn = sqlite3.connect(DB_PATH)
-    row = conn.execute("SELECT session_id FROM sessions WHERE channel=? AND source_id=? ORDER BY last_active_at DESC LIMIT 1", (channel, source_id)).fetchone()
+    row = conn.execute("SELECT session_id FROM sessions WHERE channel=? AND source_id=? AND archived_at IS NULL ORDER BY last_active_at DESC LIMIT 1", (channel, source_id)).fetchone()
     if row:
         conn.execute("UPDATE sessions SET last_active_at=CURRENT_TIMESTAMP WHERE session_id=?", (row[0],)); conn.commit(); conn.close(); return str(row[0])
     mapping = load_session_map(); session_id = str(mapping.get(key) or key)
@@ -98,7 +99,6 @@ def start_new_session(channel: str, source_id: str) -> str:
     session_id = f"{key}:session-{uuid.uuid4().hex[:10]}"
     conn = sqlite3.connect(DB_PATH)
     conn.execute("INSERT INTO sessions(session_id, channel, source_id) VALUES (?, ?, ?)", (session_id, channel, source_id)); conn.commit(); conn.close()
-    mapping = load_session_map(); mapping[key] = session_id; save_session_map(mapping)
     return session_id
 
 
@@ -111,7 +111,9 @@ class ConversationStore:
             "id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, "
             "role TEXT NOT NULL, content TEXT NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)"
         )
-        self.conn.execute("CREATE TABLE IF NOT EXISTS sessions (session_id TEXT PRIMARY KEY, channel TEXT NOT NULL, source_id TEXT NOT NULL, title TEXT NOT NULL DEFAULT '', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, last_active_at DATETIME DEFAULT CURRENT_TIMESTAMP)")
+        self.conn.execute("CREATE TABLE IF NOT EXISTS sessions (session_id TEXT PRIMARY KEY, channel TEXT NOT NULL, source_id TEXT NOT NULL, title TEXT NOT NULL DEFAULT '', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, last_active_at DATETIME DEFAULT CURRENT_TIMESTAMP, archived_at DATETIME)")
+        if "archived_at" not in {row[1] for row in self.conn.execute("PRAGMA table_info(sessions)")}: self.conn.execute("ALTER TABLE sessions ADD COLUMN archived_at DATETIME")
+        self.conn.execute("CREATE TABLE IF NOT EXISTS files (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, path TEXT NOT NULL, name TEXT NOT NULL, sha256 TEXT NOT NULL, mime_type TEXT, size_bytes INTEGER NOT NULL, parse_status TEXT NOT NULL DEFAULT 'received', created_at DATETIME DEFAULT CURRENT_TIMESTAMP)")
         columns = {row[1] for row in self.conn.execute("PRAGMA table_info(messages)")}
         if "platform" not in columns:
             self.conn.execute("ALTER TABLE messages ADD COLUMN platform TEXT NOT NULL DEFAULT 'dingtalk'")
@@ -196,7 +198,7 @@ async def ask_openai(session_id: str, prompt: str, platform: str = "dingtalk") -
     return answer
 
 
-async def ask_backend(session_id: str, prompt: str, platform: str = "dingtalk") -> str:
+async def ask_backend(session_id: str, prompt: str, platform: str = "dingtalk", actor_id: str = "") -> str:
     if AI_BACKEND == "codex":
         if not CODEX_BRIDGE_TOKEN:
             raise RuntimeError("CODEX_BRIDGE_TOKEN is not configured")
@@ -206,7 +208,7 @@ async def ask_backend(session_id: str, prompt: str, platform: str = "dingtalk") 
             async with session.post(
                 CODEX_BRIDGE_URL,
                 headers=headers,
-                json={"session_id": session_id, "prompt": prompt},
+                json={"session_id": session_id, "prompt": prompt, "actor_id": actor_id},
             ) as response:
                 body = await response.json(content_type=None)
                 if response.status >= 400:
@@ -231,6 +233,13 @@ class WorkBotHandler(dingtalk_stream.ChatbotHandler):
             raise RuntimeError("媒体超过 50 MB 限制")
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(response.content)
+
+    def _record_file(self, session_id: str, path: Path, status: str = "received") -> None:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("CREATE TABLE IF NOT EXISTS files (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, path TEXT NOT NULL, name TEXT NOT NULL, sha256 TEXT NOT NULL, mime_type TEXT, size_bytes INTEGER NOT NULL, parse_status TEXT NOT NULL DEFAULT 'received', created_at DATETIME DEFAULT CURRENT_TIMESTAMP)")
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        conn.execute("INSERT INTO files(session_id,path,name,sha256,mime_type,size_bytes,parse_status) VALUES (?,?,?,?,?,?,?)", (session_id, str(path), path.name, digest, mimetypes.guess_type(path.name)[0], path.stat().st_size, status))
+        conn.commit(); conn.close()
 
     def _send_media(self, message, path: Path, kind: str) -> None:
         data = path.read_bytes()
@@ -295,6 +304,7 @@ class WorkBotHandler(dingtalk_stream.ChatbotHandler):
                 default_name = {"图片": "image.png", "视频": "video.bin"}.get(label, "file.bin")
                 target = sid_dir / (Path(media_name).name or default_name)
                 await asyncio.to_thread(self._download_media, download_code, target)
+                await asyncio.to_thread(self._record_file, session_id, target)
                 relative = target.relative_to(DB_PATH.parent.parent)
                 media_context.append(f"收到的{label}：{target.name}，本地路径：{relative}")
                 LOGGER.info("Downloaded DingTalk %s for Codex: %s", label, target)
@@ -360,7 +370,7 @@ class WorkBotHandler(dingtalk_stream.ChatbotHandler):
             notify.session_id = session_id
 
             try:
-                answer = await run_with_progress(ask_backend(session_id, text, "dingtalk"), notify)
+                answer = await run_with_progress(ask_backend(session_id, text, "dingtalk", sender_id), notify)
             except Exception:
                 LOGGER.exception("Failed to process message from %s", sender_id)
                 answer = "本地 Codex 暂时不可用，请检查 Bridge 状态和配置。" if AI_BACKEND == "codex" else "尚未配置 OPENAI_API_KEY，当前只能验证钉钉连接。"

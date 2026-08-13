@@ -83,6 +83,7 @@ def login_page(error="") -> str:
 
 
 def dashboard(c: dict, view: str, channel: str, start: str, end: str, session_id: str = "", range_name: str = "") -> str:
+    archived_view = view == "archived"
     active_range = range_name if range_name in {"today", "yesterday", "week", "last_week", "month", "last_month", "year"} else "custom"
     if view == "records" and not start and not end:
         start, end = preset_range("today"); active_range = "today"
@@ -112,7 +113,7 @@ def dashboard(c: dict, view: str, channel: str, start: str, end: str, session_id
                     (SELECT content FROM messages u WHERE u.session_id=m.session_id AND u.platform=m.platform AND u.role='user' ORDER BY u.id LIMIT 1),
                     (SELECT content FROM messages f WHERE f.session_id=m.session_id AND f.platform=m.platform ORDER BY f.id LIMIT 1)
                 )
-                FROM messages m WHERE m.platform=?"""
+                FROM messages m JOIN sessions s ON s.session_id=m.session_id WHERE m.platform=? AND s.archived_at IS %s""" % ("NOT NULL" if archived_view else "NULL")
             args = [channel]
             if start: query += " AND created_at >= ?"; args.append(start.replace("T", " "))
             if end: query += " AND created_at <= ?"; args.append(end.replace("T", " "))
@@ -121,7 +122,9 @@ def dashboard(c: dict, view: str, channel: str, start: str, end: str, session_id
                 title = str(title or "（无标题消息）").strip()
                 short_title = title if len(title) <= 48 else title[:48] + "…"
                 params = urlencode({"view": "records", "channel": channel, "range": "custom", "start": start, "end": end, "session": sid})
-                sessions.append(f"<tr><td><a title='{html.escape(title, quote=True)}' href='/?{params}'>{html.escape(short_title)}</a><div class=muted style='font-size:11px;margin-top:4px'>{html.escape(sid[:42])}</div></td><td>{html.escape(first_seen or '')}</td><td>{html.escape(last_seen or '')}</td><td>{count}</td></tr>")
+                action = "restore" if archived_view else "archive"
+                label = "恢复" if archived_view else "归档"
+                sessions.append(f"<tr><td><a title='{html.escape(title, quote=True)}' href='/?{params}'>{html.escape(short_title)}</a><div class=muted style='font-size:11px;margin-top:4px'>{html.escape(sid[:42])}</div></td><td>{html.escape(first_seen or '')}</td><td>{html.escape(last_seen or '')}</td><td>{count}</td><td><form method=post action=/session/{action}><input type=hidden name=session_id value='{html.escape(sid)}'><button class=secondary>{label}</button></form></td></tr>")
             conn.close()
     table = "".join(rows) or "<tr><td colspan=5 class=muted>当前筛选暂无记录</td></tr>"
     selected_d = "selected" if channel == "dingtalk" else ""; selected_w = "selected" if channel == "wechat" else ""
@@ -129,8 +132,9 @@ def dashboard(c: dict, view: str, channel: str, start: str, end: str, session_id
     body += f"<div class=tabs><a class='tab {'active' if view == 'records' else ''}' href='/?view=records&channel={channel}'>聊天记录</a><a class='tab {'active' if view == 'config' else ''}' href='/?view=config'>配置</a></div>"
     if view == "config":
         full_access = bool(c.get("full_access", False))
+        access_users = str(c.get("full_access_users", ""))
         checked = "checked" if full_access else ""
-        access_panel = f"<div class=panel><h2>Codex 权限</h2><form method=post action=/permissions><label style='display:flex;gap:10px;align-items:center'><input type=checkbox name=full_access value=1 {checked} style='width:auto'>启用完全权限</label><p class=muted>关闭时使用只读沙箱。启用后 Codex 可修改文件、执行命令并访问宿主机资源，请仅在可信工作场景使用。</p><button class='secondary'>保存权限</button></form></div>"
+        access_panel = f"<div class=panel><h2>Codex 权限</h2><form method=post action=/permissions><label style='display:flex;gap:10px;align-items:center'><input type=checkbox name=full_access value=1 {checked} style='width:auto'>启用完全权限</label><label>完全权限用户白名单（每行一个账号）<textarea name=full_access_users rows=3 style='width:100%;padding:10px'>{html.escape(access_users)}</textarea></label><label style='display:flex;gap:10px;align-items:center'><input type=checkbox name=high_risk_confirm value=1 {'checked' if c.get('high_risk_confirm', True) else ''} style='width:auto'>高风险操作必须明确确认</label><p class=muted>启用后仍要求请求中包含“确认执行高风险操作”，用于降低误操作风险。</p><button class='secondary'>保存权限</button></form></div>"
         limits = {"max_history_messages": int(c.get("max_history_messages", 32)), "context_summary_threshold_tokens": int(c.get("context_summary_threshold_tokens", c.get("context_summary_threshold", 6000))), "max_message_tokens": int(c.get("max_message_tokens", c.get("max_message_chars", 2500))), "summary_max_tokens": int(c.get("summary_max_tokens", c.get("summary_max_chars", 1200))), "memory_context_tokens": int(c.get("memory_context_tokens", 6000)), "total_context_tokens": int(c.get("total_context_tokens", 16000))}
         body += f"<div class=panel><h2>消息入口</h2><form method=post action=/config><div class=grid><div><label>当前渠道</label><select name=channel><option value=dingtalk {selected_d}>钉钉</option><option value=wechat {selected_w}>微信</option></select></div><div style='display:flex;align-items:end'><button>保存渠道</button></div></div><div class=grid style='margin-top:18px'><div><label>钉钉 Client ID</label><input name=client_id value='{html.escape(c.get('dingtalk', {}).get('client_id', ''))}'></div><div><label>钉钉 Client Secret</label><input type=password name=client_secret value='{html.escape(c.get('dingtalk', {}).get('client_secret', ''))}'></div></div><div class=grid style='margin-top:18px'><div><label>保留最近消息数</label><input type=number name=max_history_messages min=1 max=200 value='{limits['max_history_messages']}'></div><div><label>自动摘要阈值（token）</label><input type=number name=context_summary_threshold_tokens min=100 max=100000 value='{limits['context_summary_threshold_tokens']}'></div><div><label>单条消息上限（token）</label><input type=number name=max_message_tokens min=100 max=20000 value='{limits['max_message_tokens']}'></div><div><label>摘要最大长度（token）</label><input type=number name=summary_max_tokens min=100 max=10000 value='{limits['summary_max_tokens']}'></div><div><label>长期记忆上限（token）</label><input type=number name=memory_context_tokens min=500 max=50000 value='{limits['memory_context_tokens']}'></div><div><label>总上下文预算（token）</label><input type=number name=total_context_tokens min=1000 max=100000 value='{limits['total_context_tokens']}'></div></div></form></div>" + access_panel
         body += f"<div class=panel><h2>微信登录</h2>{qr_html}<p class=muted>选择微信并保存后，系统自动生成二维码。扫码成功后凭据保存在本机数据目录。</p></div>"
@@ -141,7 +145,7 @@ def dashboard(c: dict, view: str, channel: str, start: str, end: str, session_id
         session_panel = ""
         if not session_id:
             session_table = "".join(sessions) or "<tr><td colspan=4 class=muted>当前筛选暂无会话</td></tr>"
-            session_panel = f"<div class=panel><div class=top><h2>按会话查看</h2><span class=muted>{len(sessions)} 个会话</span></div><div style='overflow:auto'><table><thead><tr><th>会话标题</th><th>开始时间</th><th>最后活动</th><th>消息数</th></tr></thead><tbody>{session_table}</tbody></table></div></div>"
+            session_panel = f"<div class=panel><div class=top><h2>按会话查看</h2><span class=muted>{len(sessions)} 个会话</span></div><div style='overflow:auto'><table><thead><tr><th>会话标题</th><th>开始时间</th><th>最后活动</th><th>消息数</th><th>操作</th></tr></thead><tbody>{session_table}</tbody></table></div><p><a class=tab href='/?view=archived&channel={channel}'>查看已归档会话</a></p></div>"
         else:
             return_params = urlencode({"view": "records", "channel": channel, "range": active_range if active_range != "custom" else "today"})
             session_panel = f"<p><a class=tab href='/?{return_params}'>返回会话列表</a> <span class=muted>当前会话：{html.escape(session_id)}</span></p>"
@@ -193,15 +197,23 @@ class Handler(BaseHTTPRequestHandler):
             else: self.respond(login_page("密码错误"), 401)
             return
         if not logged_in(self): self.respond(login_page(), 401); return
+        if path == "/session/archive":
+            sid = data.get("session_id", [""])[0]
+            conn = sqlite3.connect(DATA / "bot.db"); conn.execute("UPDATE sessions SET archived_at=CURRENT_TIMESTAMP WHERE session_id=?", (sid,)); conn.commit(); conn.close()
+            self.respond("", 303, {"Location":"/?view=records"}); return
+        if path == "/session/restore":
+            sid = data.get("session_id", [""])[0]
+            conn = sqlite3.connect(DATA / "bot.db"); conn.execute("UPDATE sessions SET archived_at=NULL, last_active_at=CURRENT_TIMESTAMP WHERE session_id=?", (sid,)); conn.commit(); conn.close()
+            self.respond("", 303, {"Location":"/?view=records"}); return
         if path == "/config":
             old = load_config()
             def bounded(name, default, minimum, maximum):
                 try: return max(minimum, min(maximum, int(data.get(name, [default])[0])))
                 except (TypeError, ValueError): return default
-            save_config({"channel": data.get("channel", ["dingtalk"])[0], "dingtalk": {"client_id": data.get("client_id", [""])[0], "client_secret": data.get("client_secret", [""])[0]}, "admin_password": old.get("admin_password", PASSWORD), "full_access": bool(old.get("full_access", False)), "max_history_messages": bounded("max_history_messages", 32, 1, 200), "context_summary_threshold_tokens": bounded("context_summary_threshold_tokens", 6000, 100, 100000), "max_message_tokens": bounded("max_message_tokens", 2500, 100, 20000), "summary_max_tokens": bounded("summary_max_tokens", 1200, 100, 10000), "memory_context_tokens": bounded("memory_context_tokens", 6000, 500, 50000), "total_context_tokens": bounded("total_context_tokens", 16000, 1000, 100000)})
+            save_config({"channel": data.get("channel", ["dingtalk"])[0], "dingtalk": {"client_id": data.get("client_id", [""])[0], "client_secret": data.get("client_secret", [""])[0]}, "admin_password": old.get("admin_password", PASSWORD), "full_access": bool(old.get("full_access", False)), "full_access_users": old.get("full_access_users", ""), "high_risk_confirm": bool(old.get("high_risk_confirm", True)), "max_history_messages": bounded("max_history_messages", 32, 1, 200), "context_summary_threshold_tokens": bounded("context_summary_threshold_tokens", 6000, 100, 100000), "max_message_tokens": bounded("max_message_tokens", 2500, 100, 20000), "summary_max_tokens": bounded("summary_max_tokens", 1200, 100, 10000), "memory_context_tokens": bounded("memory_context_tokens", 6000, 500, 50000), "total_context_tokens": bounded("total_context_tokens", 16000, 1000, 100000)})
             self.respond("", 303, {"Location":"/"}); return
         if path == "/permissions":
-            old = load_config(); old["full_access"] = data.get("full_access", [""])[0] == "1"; save_config(old)
+            old = load_config(); old["full_access"] = data.get("full_access", [""])[0] == "1"; old["full_access_users"] = data.get("full_access_users", [""])[0]; old["high_risk_confirm"] = data.get("high_risk_confirm", [""])[0] == "1"; save_config(old)
             self.respond("", 303, {"Location":"/?view=config"}); return
         if path == "/password":
             new_password = data.get("password", [""])[0]

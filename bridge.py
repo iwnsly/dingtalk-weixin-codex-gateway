@@ -79,10 +79,15 @@ def authorized(headers) -> bool:
     return secrets.compare_digest(headers.get("Authorization", ""), f"Bearer {TOKEN}")
 
 
-def full_access_enabled() -> bool:
+def full_access_enabled(actor_id: str = "", prompt: str = "") -> bool:
     try:
         if RUNTIME_CONFIG_PATH.exists():
-            return bool(json.loads(RUNTIME_CONFIG_PATH.read_text()).get("full_access", False))
+            config = json.loads(RUNTIME_CONFIG_PATH.read_text())
+            if not config.get("full_access", False): return False
+            users = {item.strip() for item in str(config.get("full_access_users", "")).replace("\n", ",").split(",") if item.strip()}
+            if users and actor_id not in users: return False
+            risky = any(word in prompt for word in ("删除", "清空", "批量修改", "执行命令", "sudo", "rm -"))
+            return not (config.get("high_risk_confirm", True) and risky and "确认执行高风险操作" not in prompt)
     except (OSError, ValueError):
         LOGGER.warning("Unable to read runtime permission config; using read-only mode")
     return False
@@ -166,7 +171,9 @@ def load_conversation_context(session_id: str, max_messages: int) -> tuple[str, 
             (session_id, max_messages),
         ).fetchall()
         try:
-            summary_row = conn.execute("SELECT summary, source_count FROM conversation_summaries WHERE session_id=?", (session_id,)).fetchone()
+            conn.execute("CREATE TABLE IF NOT EXISTS conversation_summaries (session_id TEXT PRIMARY KEY, summary TEXT NOT NULL, source_count INTEGER NOT NULL DEFAULT 0, version INTEGER NOT NULL DEFAULT 0, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)")
+            if "version" not in {row[1] for row in conn.execute("PRAGMA table_info(conversation_summaries)")}: conn.execute("ALTER TABLE conversation_summaries ADD COLUMN version INTEGER NOT NULL DEFAULT 0")
+            summary_row = conn.execute("SELECT summary, source_count, version FROM conversation_summaries WHERE session_id=?", (session_id,)).fetchone()
         except sqlite3.OperationalError:
             summary_row = None
         total_count = conn.execute("SELECT COUNT(*) FROM messages WHERE session_id=?", (session_id,)).fetchone()[0]
@@ -177,7 +184,7 @@ def load_conversation_context(session_id: str, max_messages: int) -> tuple[str, 
         LOGGER.exception("Unable to load conversation history")
         return "", "", "", 0, 0
     rows.reverse()
-    summary, source_count = summary_row or ("", 0)
+    summary, source_count, _version = summary_row or ("", 0, 0)
     recent = "\n".join(f"{role}: {content}" for role, content in rows if content)
     pending = "\n".join(f"{role}: {content}" for role, content in pending_rows if content)
     return recent, pending, summary, int(source_count or 0), int(total_count or 0)
@@ -185,8 +192,9 @@ def load_conversation_context(session_id: str, max_messages: int) -> tuple[str, 
 
 def save_conversation_summary(session_id: str, summary: str, source_count: int) -> None:
     conn = sqlite3.connect(DB_PATH)
-    conn.execute("CREATE TABLE IF NOT EXISTS conversation_summaries (session_id TEXT PRIMARY KEY, summary TEXT NOT NULL, source_count INTEGER NOT NULL DEFAULT 0, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)")
-    conn.execute("INSERT INTO conversation_summaries(session_id, summary, source_count, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP) ON CONFLICT(session_id) DO UPDATE SET summary=excluded.summary, source_count=excluded.source_count, updated_at=CURRENT_TIMESTAMP", (session_id, summary, source_count))
+    conn.execute("CREATE TABLE IF NOT EXISTS conversation_summaries (session_id TEXT PRIMARY KEY, summary TEXT NOT NULL, source_count INTEGER NOT NULL DEFAULT 0, version INTEGER NOT NULL DEFAULT 0, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)")
+    if "version" not in {row[1] for row in conn.execute("PRAGMA table_info(conversation_summaries)")}: conn.execute("ALTER TABLE conversation_summaries ADD COLUMN version INTEGER NOT NULL DEFAULT 0")
+    conn.execute("INSERT INTO conversation_summaries(session_id, summary, source_count, version, updated_at) VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP) ON CONFLICT(session_id) DO UPDATE SET summary=excluded.summary, source_count=excluded.source_count, version=conversation_summaries.version+1, updated_at=CURRENT_TIMESTAMP", (session_id, summary, source_count))
     conn.commit(); conn.close()
 
 
@@ -220,8 +228,8 @@ def invoke_codex_sync_summary(session_id: str, existing_summary: str, history: s
     return truncate_tokens(answer, SUMMARY_MAX_TOKENS)
 
 
-async def invoke_codex(prompt: str, session_id: str) -> str:
-    full_access = full_access_enabled()
+async def invoke_codex(prompt: str, session_id: str, actor_id: str = "") -> str:
+    full_access = full_access_enabled(actor_id, prompt)
     sandbox = "danger-full-access" if full_access else "read-only"
     LOGGER.warning("Invoking Codex with sandbox mode: %s", sandbox)
     proc = await asyncio.create_subprocess_exec(
@@ -320,6 +328,7 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(length))
             prompt = str(body.get("prompt", "")).strip()
             session_id = str(body.get("session_id", "")).strip()
+            actor_id = str(body.get("actor_id", "")).strip()
             max_messages, summary_threshold, max_message_tokens, summary_max_tokens, memory_tokens, total_tokens = runtime_limits()
             if not prompt:
                 self._json({"error": "invalid prompt"}, 400)
@@ -329,7 +338,7 @@ class Handler(BaseHTTPRequestHandler):
                 session_id = "default"
             access_note = (
                 "当前请求运行在完全权限模式，可以修改文件、执行命令并访问宿主机资源；仅执行用户明确要求的操作。"
-                if full_access_enabled() else
+                if full_access_enabled(actor_id, prompt) else
                 "如果需要修改文件或执行操作，当前请求运行在只读沙箱；请说明限制。"
             )
             memory_context = load_codex_memory_context(memory_tokens)
@@ -376,7 +385,7 @@ class Handler(BaseHTTPRequestHandler):
             f"会话标识：{session_id}\n用户消息：{prompt}"
             )
             set_status(session_id, "working", "正在启动 Codex")
-            answer = asyncio.run(invoke_codex(instruction, session_id))
+            answer = asyncio.run(invoke_codex(instruction, session_id, actor_id))
             set_status(session_id, "completed", "已完成")
             self._json({"session_id": session_id, "answer": answer})
         except (ValueError, RuntimeError) as exc:
