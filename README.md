@@ -150,7 +150,7 @@ data/weixin_token.json
 
 微信和钉钉会按用户/会话持续保留最近的聊天上下文。每次请求会将当前会话最近的消息与本机 Codex 长期记忆一起提供给 Codex，因此连续提问可以引用前文。发送 `/new`、`/newsession`、“新开会话”“开始新会话”或“新建会话”会创建一个新的空白会话；旧会话记录不会删除，仍可在管理后台按渠道和会话查看。
 
-上下文默认保留最近 32 条消息；当新增的未摘要历史超过 10,000 个字符时，Bridge 会基于已有摘要增量生成新摘要，再将摘要和近期消息提供给 Codex。单条消息默认最多 5,000 个字符，摘要默认最多 2,500 个字符，超出部分会截断。以上参数可在管理后台“配置”页修改。摘要保存在 SQLite 的 `conversation_summaries` 表中。
+上下文默认保留最近 32 条消息，并使用 token 预算控制输入大小：新增未摘要历史超过 6,000 token 时，Bridge 会基于已有摘要增量生成新摘要；单条消息默认最多 2,500 token，摘要默认最多 1,200 token，长期记忆默认最多 6,000 token，总上下文预算默认 16,000 token。超出部分按优先级动态裁剪，以上参数可在管理后台“配置”页修改。摘要保存在 SQLite 的 `conversation_summaries` 表中。
 
 管理后台的“聊天记录”页面增加了“按会话查看”：先选择微信或钉钉及时间范围，再点击会话汇总中的会话 ID，可查看该会话的完整消息明细。
 
@@ -174,7 +174,11 @@ data/weixin_token.json
 | `CODEX_BRIDGE_TOKEN` | 空 | Bridge Bearer Token |
 | `CODEX_RUNTIME_CONFIG_PATH` | `./data/runtime.json` | 完全权限开关配置文件路径 |
 | `CODEX_MEMORY_DIR` | `~/.codex/memories` | 本机 Codex 长期记忆目录；Bridge 会在每次微信/钉钉请求前读取其中的 Markdown 文件 |
-| `CODEX_MEMORY_CONTEXT_CHARS` | `24000` | 注入单次 Codex 请求的长期记忆最大字符数 |
+| `CODEX_MEMORY_CONTEXT_TOKENS` | `6000` | 注入单次 Codex 请求的长期记忆最大 token 数 |
+| `MAX_INPUT_TOKENS` | `2500` | 单条输入消息最大 token 数 |
+| `CONTEXT_SUMMARY_THRESHOLD_TOKENS` | `6000` | 增量摘要触发阈值 |
+| `SUMMARY_MAX_TOKENS` | `1200` | 摘要最大 token 数 |
+| `TOTAL_CONTEXT_TOKENS` | `16000` | 单次请求总上下文预算 |
 | `CODEX_BIN` | Codex Desktop CLI 路径 | Bridge 使用的 Codex 可执行文件 |
 | `CODEX_CWD` | 当前目录 | Codex 工作目录 |
 | `CODEX_BRIDGE_HOST` | `127.0.0.1` | Bridge 监听地址；Docker 容器调用宿主机 Bridge 时设为 `0.0.0.0` |

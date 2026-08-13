@@ -3,3 +3,4 @@ aiohttp>=3.10,<4
 qrcode[pil]>=7.4,<9
 cryptography>=43,<47
 requests>=2.31,<3
+tiktoken>=0.7,<1

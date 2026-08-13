@@ -8,6 +8,10 @@ import json
 import threading
 import sqlite3
 import subprocess
+try:
+    import tiktoken
+except ImportError:
+    tiktoken = None
 from urllib.parse import parse_qs, urlparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -26,18 +30,47 @@ CODEX_BIN = os.getenv("CODEX_BIN", "/Applications/ChatGPT.app/Contents/Resources
 CODEX_CWD = os.getenv("CODEX_CWD", str(Path.cwd()))
 RUNTIME_CONFIG_PATH = Path(os.getenv("CODEX_RUNTIME_CONFIG_PATH", str(Path(CODEX_CWD) / "data" / "runtime.json")))
 TIMEOUT = int(os.getenv("CODEX_BRIDGE_TIMEOUT_SECONDS", "180"))
-MAX_INPUT = int(os.getenv("MAX_INPUT_CHARS", "5000"))
+MAX_INPUT_TOKENS = int(os.getenv("MAX_INPUT_TOKENS", "2500"))
 STATUSES: dict[str, dict] = {}
 STATUS_LOCK = threading.Lock()
 STATUS_FILE = Path(os.getenv("CODEX_STATUS_FILE", str(Path(CODEX_CWD) / "data" / "codex_status.json")))
 CODEX_MEMORY_DIR = Path(os.getenv("CODEX_MEMORY_DIR", str(Path.home() / ".codex" / "memories"))).expanduser()
-MEMORY_CONTEXT_CHARS = int(os.getenv("CODEX_MEMORY_CONTEXT_CHARS", "24000"))
+MEMORY_CONTEXT_TOKENS = int(os.getenv("CODEX_MEMORY_CONTEXT_TOKENS", "6000"))
 DB_PATH = Path(os.getenv("DB_PATH", str(Path(CODEX_CWD) / "data" / "bot.db")))
 if not DB_PATH.exists() and DB_PATH == Path("/app/data/bot.db"):
     DB_PATH = Path(CODEX_CWD) / "data" / "bot.db"
 MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "32"))
-CONTEXT_SUMMARY_THRESHOLD = int(os.getenv("CONTEXT_SUMMARY_THRESHOLD", "10000"))
-SUMMARY_MAX_CHARS = int(os.getenv("SUMMARY_MAX_CHARS", "2500"))
+CONTEXT_SUMMARY_THRESHOLD_TOKENS = int(os.getenv("CONTEXT_SUMMARY_THRESHOLD_TOKENS", "6000"))
+SUMMARY_MAX_TOKENS = int(os.getenv("SUMMARY_MAX_TOKENS", "1200"))
+TOTAL_CONTEXT_TOKENS = int(os.getenv("TOTAL_CONTEXT_TOKENS", "16000"))
+
+
+def token_count(text: str) -> int:
+    if not text:
+        return 0
+    if tiktoken:
+        try:
+            return len(tiktoken.get_encoding("cl100k_base").encode(text, disallowed_special=()))
+        except Exception:
+            pass
+    return max(1, (len(text) + 2) // 3)
+
+
+def truncate_tokens(text: str, limit: int, from_end: bool = False) -> str:
+    if limit <= 0 or not text:
+        return ""
+    if token_count(text) <= limit:
+        return text
+    if tiktoken:
+        try:
+            enc = tiktoken.get_encoding("cl100k_base")
+            ids = enc.encode(text, disallowed_special=())
+            ids = ids[-limit:] if from_end else ids[:limit]
+            return enc.decode(ids)
+        except Exception:
+            pass
+    chars = max(1, limit * 3)
+    return text[-chars:] if from_end else text[:chars]
 
 
 def authorized(headers) -> bool:
@@ -55,16 +88,18 @@ def full_access_enabled() -> bool:
     return False
 
 
-def runtime_limits() -> tuple[int, int, int, int]:
-    values = (MAX_HISTORY_MESSAGES, CONTEXT_SUMMARY_THRESHOLD, MAX_INPUT, SUMMARY_MAX_CHARS)
+def runtime_limits() -> tuple[int, int, int, int, int, int]:
+    values = (MAX_HISTORY_MESSAGES, CONTEXT_SUMMARY_THRESHOLD_TOKENS, MAX_INPUT_TOKENS, SUMMARY_MAX_TOKENS, MEMORY_CONTEXT_TOKENS, TOTAL_CONTEXT_TOKENS)
     try:
         if RUNTIME_CONFIG_PATH.exists():
             config = json.loads(RUNTIME_CONFIG_PATH.read_text())
             return (
                 max(1, int(config.get("max_history_messages", values[0]))),
-                max(1000, int(config.get("context_summary_threshold", values[1]))),
-                max(500, int(config.get("max_message_chars", values[2]))),
-                max(500, int(config.get("summary_max_chars", values[3]))),
+                max(100, int(config.get("context_summary_threshold_tokens", config.get("context_summary_threshold", values[1])))),
+                max(100, int(config.get("max_message_tokens", values[2]))),
+                max(100, int(config.get("summary_max_tokens", config.get("summary_max_chars", values[3])))),
+                max(500, int(config.get("memory_context_tokens", values[4]))),
+                max(1000, int(config.get("total_context_tokens", values[5]))),
             )
     except (OSError, ValueError, TypeError):
         LOGGER.warning("Unable to read conversation limit configuration")
@@ -92,7 +127,7 @@ def set_status(session_id: str, status: str, detail: str = "") -> None:
             LOGGER.warning("Unable to persist Codex status file")
 
 
-def load_codex_memory_context() -> str:
+def load_codex_memory_context(max_tokens: int = MEMORY_CONTEXT_TOKENS) -> str:
     """Load the local Codex memory corpus for ephemeral IM requests."""
     if not CODEX_MEMORY_DIR.is_dir():
         LOGGER.warning("Codex memory directory does not exist: %s", CODEX_MEMORY_DIR)
@@ -110,13 +145,14 @@ def load_codex_memory_context() -> str:
         if not text:
             continue
         chunk = f"[{path}]\n{text}"
-        remaining = MEMORY_CONTEXT_CHARS - used
+        remaining = max_tokens - used
         if remaining <= 0:
             break
-        chunks.append(chunk[:remaining])
-        used += min(len(chunk), remaining)
+        clipped = truncate_tokens(chunk, remaining)
+        chunks.append(clipped)
+        used += token_count(clipped)
     if chunks:
-        LOGGER.info("Loaded Codex memory context: %d files, %d chars", len(chunks), used)
+        LOGGER.info("Loaded Codex memory context: %d files, %d tokens", len(chunks), used)
     return "\n\n".join(chunks)
 
 
@@ -181,7 +217,7 @@ def invoke_codex_sync_summary(session_id: str, existing_summary: str, history: s
         item = event.get("item") or {}
         if event.get("type") == "item.completed" and item.get("type") == "agent_message":
             answer = str(item.get("text") or "").strip()
-    return answer[:3000]
+    return truncate_tokens(answer, SUMMARY_MAX_TOKENS)
 
 
 async def invoke_codex(prompt: str, session_id: str) -> str:
@@ -284,11 +320,11 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(length))
             prompt = str(body.get("prompt", "")).strip()
             session_id = str(body.get("session_id", "")).strip()
-            max_messages, summary_threshold, max_message_chars, summary_max_chars = runtime_limits()
+            max_messages, summary_threshold, max_message_tokens, summary_max_tokens, memory_tokens, total_tokens = runtime_limits()
             if not prompt:
                 self._json({"error": "invalid prompt"}, 400)
                 return
-            prompt = prompt[:max_message_chars]
+            prompt = truncate_tokens(prompt, max_message_tokens)
             if not session_id:
                 session_id = "default"
             access_note = (
@@ -296,17 +332,25 @@ class Handler(BaseHTTPRequestHandler):
                 if full_access_enabled() else
                 "如果需要修改文件或执行操作，当前请求运行在只读沙箱；请说明限制。"
             )
-            memory_context = load_codex_memory_context()
+            memory_context = load_codex_memory_context(memory_tokens)
             conversation_context, pending_context, conversation_summary, summary_source_count, total_count = load_conversation_context(session_id, max_messages)
-            if len(pending_context) > summary_threshold and total_count > summary_source_count:
+            if token_count(pending_context) > summary_threshold and total_count > summary_source_count:
                 try:
                     summary = invoke_codex_sync_summary(session_id, conversation_summary, pending_context)
                     if summary:
                         save_conversation_summary(session_id, summary, total_count)
-                        conversation_summary = summary[:summary_max_chars]
+                        conversation_summary = truncate_tokens(summary, summary_max_tokens)
                 except Exception:
                     LOGGER.exception("Unable to summarize conversation; using truncated history")
-            conversation_context = conversation_context[-summary_threshold:]
+            conversation_context = truncate_tokens(conversation_context, summary_threshold, from_end=True)
+            # Keep the current request and control instructions intact; reclaim budget
+            # from lower-priority memory and summary content first.
+            prompt_tokens = token_count(prompt)
+            summary_budget = min(summary_max_tokens, max(100, total_tokens // 8))
+            conversation_summary = truncate_tokens(conversation_summary, summary_budget)
+            fixed_without_memory = token_count(conversation_summary) + prompt_tokens + 500
+            memory_budget = min(memory_tokens, max(500, total_tokens - fixed_without_memory - 1000))
+            memory_context = truncate_tokens(memory_context, memory_budget)
             memory_note = (
                 "以下是本机桌面 Codex 的完整长期记忆内容。回答涉及用户资料或历史记忆的问题时，"
                 "必须先参考这些内容；不要因为当前请求是临时会话就声称没有长期记忆。除非用户明确要求，"
@@ -321,6 +365,9 @@ class Handler(BaseHTTPRequestHandler):
                 f"{conversation_context}\n\n"
                 if conversation_context or conversation_summary else "当前会话暂无历史消息。\n\n"
             )
+            fixed_tokens = token_count(memory_note) + token_count(conversation_summary) + token_count(prompt) + 500
+            recent_budget = max(500, total_tokens - fixed_tokens)
+            conversation_context = truncate_tokens(conversation_context, recent_budget, from_end=True)
             instruction = (
             "你是通过即时通讯接入的本地 Codex 工作助手。"
             f"请直接回答用户问题；{access_note}\n\n"
