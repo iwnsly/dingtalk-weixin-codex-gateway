@@ -156,6 +156,8 @@ data/weixin_token.json
 
 完全权限支持用户白名单和高风险确认：配置白名单后仅匹配的真实 IM 用户可使用完全权限；涉及删除、清空、批量修改或执行命令时，还需在消息中明确包含“确认执行高风险操作”。管理后台支持会话归档、恢复和切换查看。
 
+归档会话不会删除聊天记录和附件，只会从默认活动会话中隐藏；恢复后可继续使用。文件元数据保存在 SQLite 的 `files` 表，`parse_status` 当前记录为 `received`，后续可扩展为文本解析、视觉解析或失败状态。
+
 管理后台的“聊天记录”页面增加了“按会话查看”：先选择微信或钉钉及时间范围，再点击会话汇总中的会话 ID，可查看该会话的完整消息明细。
 
 控制台的“聊天记录”选项卡支持：
@@ -177,6 +179,8 @@ data/weixin_token.json
 | `CODEX_BRIDGE_URL` | `http://host.docker.internal:8787/v1/chat` | 本地 Bridge 地址 |
 | `CODEX_BRIDGE_TOKEN` | 空 | Bridge Bearer Token |
 | `CODEX_RUNTIME_CONFIG_PATH` | `./data/runtime.json` | 完全权限开关配置文件路径 |
+| `full_access_users` | 空 | 完全权限白名单，多个真实 IM 用户 ID 用逗号或换行分隔 |
+| `high_risk_confirm` | `true` | 高风险操作是否要求消息包含“确认执行高风险操作” |
 | `CODEX_MEMORY_DIR` | `~/.codex/memories` | 本机 Codex 长期记忆目录；Bridge 会在每次微信/钉钉请求前读取其中的 Markdown 文件 |
 | `CODEX_MEMORY_CONTEXT_TOKENS` | `6000` | 注入单次 Codex 请求的长期记忆最大 token 数 |
 | `MAX_INPUT_TOKENS` | `2500` | 单条输入消息最大 token 数 |
@@ -230,6 +234,8 @@ environment:
 ```
 
 如果没有挂载，Bridge 会明确记录“未读取到本机 Codex 长期记忆”，不会虚构记忆内容。
+
+当前长期记忆仍按本地 Markdown 文件读取并按 token 预算裁剪，尚未接入关键词或向量相关性检索；网关当前也未实现跨渠道全局请求队列和并发上限，这两项属于后续扩展。
 
 ## 开发检查
 
