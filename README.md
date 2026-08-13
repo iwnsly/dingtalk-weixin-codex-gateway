@@ -18,6 +18,16 @@
 
 两个 IM 入口共享同一个 Codex Bridge，但运行时只启用一个渠道，避免重复消费和会话混乱。
 
+本项目与同级目录的 `../remodex` 是两个独立项目：本网关面向微信/钉钉基础入口，Remodex 面向手机控制 Codex Desktop。两者不要共用 Git 根目录，也不要把 Remodex 的私有 Desktop IPC 当作本项目的稳定接口。
+
+网关项目目录：
+
+```text
+/Users/macbot/Documents/ding/dingtalk-weixin-codex-gateway
+```
+
+在网关目录内执行 Docker、Python 和 Git 命令；`../remodex` 保持独立开发、测试和提交。
+
 ## 任务进度通知
 
 微信和钉钉收到任务后会立即发送确认消息。若本地 Codex 在 `PROGRESS_INTERVAL_SECONDS` 秒内没有完成，网关会定期发送已处理时长，最终再发送结果或失败提示。
@@ -144,6 +154,20 @@ data/weixin_token.json
 - 微信和钉钉接收文件的统一流程都是“下载、校验大小、保存、把路径传给 Codex”；单个媒体最大 50 MB。
 - 钉钉媒体同样限制为单文件 50 MB，发送路径必须位于 `CODEX_CWD` 或 `data/dingtalk_files/` 内。
 
+当前渠道能力边界：
+
+| 能力 | 微信 | 钉钉 |
+| --- | --- | --- |
+| 文本、会话上下文、长期记忆 | 支持 | 支持 |
+| 语音 | 使用平台转写文本；没有转写时提示 | 使用平台转写文本；没有转写时提示 |
+| 接收图片、文件 | 支持，微信文件需要 CDN 解密 | 支持，使用 `downloadCode` |
+| 发送文件 | 支持 `发送文件 <路径>` | 支持 `发送文件 <路径>` |
+| 发送图片 | 当前未实现 | 支持 `发送图片 <路径>` |
+| 视频 | 当前只识别，未完整下载解析 | 支持接收并传入 Codex，暂不支持发送 |
+| 定时主动推送 | 支持现有 `scheduled_jobs.json` 任务 | 当前未实现 |
+
+两边都会把可下载的媒体保存到 `data/` 下并把本地路径加入 Codex 请求；图片能否被模型理解取决于当前 Provider 和模型的视觉能力。
+
 ## 聊天记录
 
 ### 会话上下文
@@ -244,6 +268,20 @@ python3 -m py_compile app.py admin.py bridge.py weixin.py
 docker compose config
 docker compose build
 ```
+
+## Git 提交
+
+本目录是独立 Git 仓库，远程仓库为 `iwnsly/dingtalk-weixin-codex-gateway`。常用流程：
+
+```bash
+cd /Users/macbot/Documents/ding/dingtalk-weixin-codex-gateway
+git status
+git add README.md app.py weixin.py bridge.py admin.py docker-compose.yml
+git commit -m "docs: clarify gateway project layout and channel capabilities"
+git push origin main
+```
+
+`.env`、`data/`、数据库、微信登录令牌和其他运行时密钥已由 `.gitignore` 排除，禁止将它们加入提交。
 
 ## License
 
