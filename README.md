@@ -23,7 +23,7 @@
 网关项目目录：
 
 ```text
-/Users/macbot/Documents/ding/dingtalk-weixin-codex-gateway
+/Users/macbot/Documents/remote/dingtalk-weixin-codex-gateway
 ```
 
 在网关目录内执行 Docker、Python 和 Git 命令；`../remodex` 保持独立开发、测试和提交。
@@ -240,6 +240,22 @@ data/weixin_token.json
 2. 从容器内请求 `http://host.docker.internal:8787/health`。
 3. 确认 `.env` 中的 `CODEX_BRIDGE_TOKEN` 与启动 Bridge 时使用的 Token 一致。
 
+### 登录成功但后台页面无法打开
+
+如果登录请求成功，但聊天记录页面显示空白、浏览器提示连接中断，或 admin 日志出现：
+
+```text
+sqlite3.OperationalError: ambiguous column name: created_at
+```
+
+说明会话汇总查询在连接 `messages` 和 `sessions` 表后使用了未限定的时间字段。当前版本已明确使用 `m.created_at` 过滤消息时间。更新代码后重新构建 admin 容器：
+
+```bash
+docker compose up -d --build admin
+```
+
+管理密码以 `data/runtime.json` 中的 `admin_password` 为准；`12345` 只是首次初始化的默认值。
+
 ### Codex 上游返回 502
 
 Bridge 健康检查正常但任务仍失败，且日志包含 `502 Bad Gateway` 或 `Upstream request failed`，说明 Codex CLI 当前配置的模型 Provider 不可用或不兼容 Responses API。检查 `~/.codex/config.toml` 中的模型、`model_provider`、`base_url` 和 `wire_api`。这类故障不属于微信、钉钉或 Docker 连接问题。
@@ -274,7 +290,7 @@ docker compose build
 本目录是独立 Git 仓库，远程仓库为 `iwnsly/dingtalk-weixin-codex-gateway`。常用流程：
 
 ```bash
-cd /Users/macbot/Documents/ding/dingtalk-weixin-codex-gateway
+cd /Users/macbot/Documents/remote/dingtalk-weixin-codex-gateway
 git status
 git add README.md app.py weixin.py bridge.py admin.py docker-compose.yml
 git commit -m "docs: clarify gateway project layout and channel capabilities"

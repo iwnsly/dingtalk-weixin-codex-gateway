@@ -115,8 +115,8 @@ def dashboard(c: dict, view: str, channel: str, start: str, end: str, session_id
                 )
                 FROM messages m JOIN sessions s ON s.session_id=m.session_id WHERE m.platform=? AND s.archived_at IS %s""" % ("NOT NULL" if archived_view else "NULL")
             args = [channel]
-            if start: query += " AND created_at >= ?"; args.append(start.replace("T", " "))
-            if end: query += " AND created_at <= ?"; args.append(end.replace("T", " "))
+            if start: query += " AND m.created_at >= ?"; args.append(start.replace("T", " "))
+            if end: query += " AND m.created_at <= ?"; args.append(end.replace("T", " "))
             query += " GROUP BY m.session_id ORDER BY MAX(m.created_at) DESC"
             for sid, first_seen, last_seen, count, title in conn.execute(query, args):
                 title = str(title or "（无标题消息）").strip()
