@@ -88,6 +88,14 @@ python3 bridge.py
 
 Compose 容器通过 `host.docker.internal` 访问宿主机，因此 Bridge 不能只绑定 `127.0.0.1`。Docker 部署时使用 `CODEX_BRIDGE_HOST=0.0.0.0`，并确保 `8787` 端口不向公网开放。Bridge 的聊天和状态接口都要求与容器一致的 Bearer Token。
 
+本机可用 macOS LaunchAgent 常驻 Bridge。当前推荐的用户级服务文件路径为：
+
+```text
+~/Library/LaunchAgents/com.iwnsly.dingtalk-weixin-codex-gateway.bridge.plist
+```
+
+服务启动后可用 `curl http://127.0.0.1:8787/health` 验证。
+
 默认 Bridge 使用 Codex 只读沙箱。登录管理控制台后，在“配置”页的“Codex 权限”中可以打开“完全权限”。
 
 | 模式 | 能力 | 建议 |
@@ -115,15 +123,34 @@ data/weixin_token.json
 
 ### 定时主动推送
 
-微信适配器会读取 `data/scheduled_jobs.json`，支持按指定时区和时间主动发送每日内容。任务发送成功后会保存 `last_sent_date`，服务重启不会在同一天重复发送；生成或发送失败时每 30 秒重试。当前任务类型 `daily_fortune` 会通过本地 Codex Bridge 生成当日运势。
+微信和钉钉定时主动推送默认关闭。需要启用时，在控制台“定时任务”页分别勾选对应渠道的执行器，或设置环境变量 `WEIXIN_ENABLE_SCHEDULED_JOBS=1`、`DINGTALK_ENABLE_SCHEDULED_JOBS=1`。后台开关保存后最多 30 秒生效，不需要重启容器。
+
+“定时任务”页统一列出微信和钉钉任务，可按渠道筛选，并查看启用状态、执行计划、执行内容、最近结果和执行时间，也可直接启停或删除任务。没有 `channel` 字段的旧任务会根据 `session_id` 自动归类，继续兼容。
+
+两个渠道共用 `data/scheduled_jobs.json`，支持按指定时区和时间主动发送每日内容。执行器会写入 `last_status`、`last_run_at`、`last_error` 和 `last_sent_at`，后台可直接查看最近执行结果。任务发送成功后会保存 `last_sent_date`，服务重启不会在同一天重复发送；生成或发送失败时每 30 秒重试。两个容器通过文件锁按任务更新状态，避免同时执行时互相覆盖。
+
+当前任务类型 `daily_fortune` 会通过本地 Codex Bridge 生成当日运势；也可在任务中设置 `prompt`，其中 `{date}` 会替换为执行日期。钉钉使用官方机器人主动发送接口，支持单聊和群聊。目标用户或群聊需要至少先向机器人发送一条消息，网关会将主动发送所需的用户、会话和机器人标识保存在 SQLite 中。
+
+钉钉定时执行器与“当前渠道”选择相互独立：当前渠道选择微信时，开启钉钉执行器仍会保持钉钉 Stream 连接用于缓存发送路由和执行定时任务，但普通钉钉消息不会转交 Codex。
 
 ```json
 [
   {
     "id": "daily-fortune",
+    "channel": "wechat",
     "type": "daily_fortune",
     "enabled": true,
     "session_id": "wechat:用户会话 ID",
+    "timezone": "Asia/Shanghai",
+    "time": "08:00",
+    "start_date": "2026-08-13"
+  },
+  {
+    "id": "dingtalk-daily-fortune",
+    "channel": "dingtalk",
+    "type": "daily_fortune",
+    "enabled": true,
+    "session_id": "dingtalk:钉钉会话 ID",
     "timezone": "Asia/Shanghai",
     "time": "08:00",
     "start_date": "2026-08-13"
@@ -164,7 +191,7 @@ data/weixin_token.json
 | 发送文件 | 支持 `发送文件 <路径>` | 支持 `发送文件 <路径>` |
 | 发送图片 | 当前未实现 | 支持 `发送图片 <路径>` |
 | 视频 | 当前只识别，未完整下载解析 | 支持接收并传入 Codex，暂不支持发送 |
-| 定时主动推送 | 支持现有 `scheduled_jobs.json` 任务 | 当前未实现 |
+| 定时主动推送 | 支持统一任务与状态记录 | 支持统一任务、单聊/群聊主动发送与状态记录 |
 
 两边都会把可下载的媒体保存到 `data/` 下并把本地路径加入 Codex 请求；图片能否被模型理解取决于当前 Provider 和模型的视觉能力。
 
@@ -216,6 +243,9 @@ data/weixin_token.json
 | `CODEX_BRIDGE_HOST` | `127.0.0.1` | Bridge 监听地址；Docker 容器调用宿主机 Bridge 时设为 `0.0.0.0` |
 | `CODEX_BRIDGE_PORT` | `8787` | Bridge 监听端口 |
 | `CODEX_BRIDGE_TIMEOUT_SECONDS` | `180` | 单次 Codex 请求超时时间 |
+| `CODEX_STATUS_TTL_SECONDS` | `CODEX_BRIDGE_TIMEOUT_SECONDS + 60` | 任务状态超时时间，超过后管理后台显示为已中断 |
+| `WEIXIN_ENABLE_SCHEDULED_JOBS` | 空 | 设置为 `1` 时启用微信定时主动推送 |
+| `DINGTALK_ENABLE_SCHEDULED_JOBS` | 空 | 设置为 `1` 时启用钉钉定时主动推送 |
 | `PROGRESS_INTERVAL_SECONDS` | `30` | IM 端任务进度通知间隔，最小 10 秒 |
 | `ADMIN_PASSWORD` | `12345` | 控制台初始密码，可在界面修改 |
 | `DB_PATH` | `/app/data/bot.db` | SQLite 路径 |
@@ -259,6 +289,10 @@ docker compose up -d --build admin
 ### Codex 上游返回 502
 
 Bridge 健康检查正常但任务仍失败，且日志包含 `502 Bad Gateway` 或 `Upstream request failed`，说明 Codex CLI 当前配置的模型 Provider 不可用或不兼容 Responses API。检查 `~/.codex/config.toml` 中的模型、`model_provider`、`base_url` 和 `wire_api`。这类故障不属于微信、钉钉或 Docker 连接问题。
+
+### 当前任务一直显示运行中
+
+任务状态保存在 `data/codex_status.json`。Bridge 启动时会把上一次遗留的 `working` / `finalizing` 标记为已中断；管理后台读取状态时也会按 `CODEX_STATUS_TTL_SECONDS` 自动把超时任务显示为已中断。若 Bridge 没有启动，IM 渠道会提示检查本地 Codex Bridge 状态。
 
 ## Codex 长期记忆
 

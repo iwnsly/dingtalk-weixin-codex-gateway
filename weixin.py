@@ -10,6 +10,8 @@ from zoneinfo import ZoneInfo
 import aiohttp
 import sqlite3
 
+from scheduled_jobs import build_prompt, load_jobs, update_job
+
 BASE = os.getenv('WEIXIN_BASE_URL', 'https://ilinkai.weixin.qq.com').rstrip('/')
 DATA = Path(os.getenv('DB_PATH', '/app/data/bot.db')).parent
 TOKEN_FILE = DATA / 'weixin_token.json'
@@ -26,6 +28,19 @@ MEDIA_KEY_CACHE = DATA / 'wechat_media_keys.json'
 SCHEDULE_FILE = DATA / 'scheduled_jobs.json'
 SESSION_MAP_FILE = DATA / 'wechat_sessions.json'
 MAX_FILE_BYTES = 50 * 1024 * 1024
+
+def truthy(value):
+    return str(value).strip().lower() in {'1', 'true', 'yes', 'on'}
+
+def scheduled_jobs_enabled():
+    if truthy(os.getenv('WEIXIN_ENABLE_SCHEDULED_JOBS', '')):
+        return True
+    try:
+        runtime = json.loads((DATA / 'runtime.json').read_text()) if (DATA / 'runtime.json').exists() else {}
+        return bool(runtime.get('wechat_scheduled_jobs', False))
+    except (OSError, ValueError):
+        LOG.warning('Unable to read scheduled job runtime config; scheduled jobs disabled')
+        return False
 
 def ensure_sessions_table():
     DB.parent.mkdir(parents=True, exist_ok=True)
@@ -87,17 +102,7 @@ def record_file(session_id: str, path: Path, status: str = 'received') -> None:
     conn.commit(); conn.close()
 
 def load_scheduled_jobs():
-    try:
-        value = json.loads(SCHEDULE_FILE.read_text(encoding='utf-8')) if SCHEDULE_FILE.exists() else []
-        return value if isinstance(value, list) else []
-    except (OSError, ValueError):
-        LOG.exception('Unable to read scheduled jobs')
-        return []
-
-def save_scheduled_jobs(jobs):
-    temporary = SCHEDULE_FILE.with_suffix('.tmp')
-    temporary.write_text(json.dumps(jobs, ensure_ascii=False, indent=2), encoding='utf-8')
-    temporary.replace(SCHEDULE_FILE)
+    return load_jobs(SCHEDULE_FILE)
 
 async def request_codex(session_id, prompt, actor_id=''):
     async with aiohttp.ClientSession() as session:
@@ -111,43 +116,60 @@ async def request_codex(session_id, prompt, actor_id=''):
                 raise RuntimeError(body.get('error') or f'Codex bridge HTTP {response.status}')
             return body
 
-def fortune_prompt(job, today):
-    return f'''请为黄克生成 {today} 的今日运势并直接给出可发送给用户的中文正文。
-依据：公历 1982 年 7 月 13 日 00:30，出生地河南开封。时区使用 Asia/Shanghai。
-要求：结合传统八字/民俗角度，包含整体、事业、财运、健康、人际、幸运色、幸运数字和今日建议；控制在 500 字以内，表达具体、克制，不要声称能够科学预测，不要提供医疗、投资等高风险确定性结论。开头写“今日运势｜{today}”，结尾注明“仅供民俗文化参考”。不要解释生成过程。'''
-
 async def run_scheduled_jobs(client):
     while True:
         try:
+            if not scheduled_jobs_enabled():
+                await asyncio.sleep(30)
+                continue
             jobs = load_scheduled_jobs()
             for job in jobs:
-                if not job.get('enabled', True) or job.get('type') != 'daily_fortune':
+                channel = str(job.get('channel', '')).strip().lower()
+                if channel and channel != 'wechat':
                     continue
-                timezone = ZoneInfo(job.get('timezone', 'Asia/Shanghai'))
-                now = datetime.now(timezone)
-                today = now.date().isoformat()
-                start_date = job.get('start_date', today)
-                hour, minute = (int(part) for part in job.get('time', '08:00').split(':', 1))
-                if today < start_date or (now.hour, now.minute) < (hour, minute):
+                if not job.get('enabled', True):
                     continue
-                if job.get('last_sent_date') == today:
-                    continue
-                source_id = job.get('session_id', '').removeprefix('wechat:')
-                if not source_id:
-                    LOG.error('Scheduled job %s has no session_id', job.get('id'))
-                    continue
-                session_id = active_session_id(source_id)
-                LOG.info('Running scheduled job %s for %s', job.get('id'), session_id)
-                body = await request_codex(session_id, fortune_prompt(job, today))
-                answer = body.get('answer') or ''
-                if not answer:
-                    raise RuntimeError('Codex returned an empty scheduled response')
-                await client.send(source_id, answer)
-                record(session_id, 'assistant', answer)
-                job['last_sent_date'] = today
-                job['last_sent_at'] = now.isoformat()
-                save_scheduled_jobs(jobs)
-                LOG.info('Sent scheduled job %s', job.get('id'))
+                try:
+                    job_id = str(job.get('id', ''))
+                    if not job_id:
+                        raise ValueError('定时任务缺少 ID')
+                    timezone = ZoneInfo(job.get('timezone', 'Asia/Shanghai'))
+                    now = datetime.now(timezone)
+                    today = now.date().isoformat()
+                    start_date = job.get('start_date', today)
+                    hour, minute = (int(part) for part in job.get('time', '08:00').split(':', 1))
+                    if today < start_date or (now.hour, now.minute) < (hour, minute):
+                        continue
+                    if job.get('last_sent_date') == today:
+                        continue
+                    source_id = job.get('session_id', '').removeprefix('wechat:')
+                    if not source_id:
+                        raise ValueError('任务缺少微信会话 ID')
+                    session_id = active_session_id(source_id)
+                    update_job(SCHEDULE_FILE, job_id, {
+                        'last_status': 'running',
+                        'last_run_at': now.isoformat(),
+                    }, remove=('last_error',))
+                    LOG.info('Running scheduled job %s for %s', job.get('id'), session_id)
+                    body = await request_codex(session_id, build_prompt(job, today))
+                    answer = body.get('answer') or ''
+                    if not answer:
+                        raise RuntimeError('Codex returned an empty scheduled response')
+                    await client.send(source_id, answer)
+                    record(session_id, 'assistant', answer)
+                    update_job(SCHEDULE_FILE, job_id, {
+                        'last_sent_date': today,
+                        'last_sent_at': now.isoformat(),
+                        'last_status': 'success',
+                    }, remove=('last_error',))
+                    LOG.info('Sent scheduled job %s', job.get('id'))
+                except Exception as exc:
+                    update_job(SCHEDULE_FILE, str(job.get('id', '')), {
+                        'last_status': 'failed',
+                        'last_error': str(exc)[:500],
+                        'last_run_at': datetime.now(ZoneInfo('UTC')).isoformat(),
+                    })
+                    LOG.exception('Scheduled job %s failed; will retry', job.get('id'))
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -340,6 +362,7 @@ async def main():
         LOG.info('Starting QR login; open admin page for QR URL'); c=await login()
     buf=''
     scheduler = asyncio.create_task(run_scheduled_jobs(c))
+    LOG.info('WeChat scheduled job worker started (%s)', 'enabled' if scheduled_jobs_enabled() else 'disabled')
     try:
         while True:
             try:

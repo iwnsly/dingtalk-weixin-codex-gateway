@@ -4,6 +4,6 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY app.py bridge.py admin.py weixin.py ./
+COPY app.py bridge.py admin.py weixin.py scheduled_jobs.py ./
 RUN mkdir -p /app/data
 CMD ["python", "app.py"]

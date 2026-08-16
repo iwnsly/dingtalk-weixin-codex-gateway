@@ -30,6 +30,7 @@ CODEX_BIN = os.getenv("CODEX_BIN", "/Applications/ChatGPT.app/Contents/Resources
 CODEX_CWD = os.getenv("CODEX_CWD", str(Path.cwd()))
 RUNTIME_CONFIG_PATH = Path(os.getenv("CODEX_RUNTIME_CONFIG_PATH", str(Path(CODEX_CWD) / "data" / "runtime.json")))
 TIMEOUT = int(os.getenv("CODEX_BRIDGE_TIMEOUT_SECONDS", "180"))
+STATUS_TTL_SECONDS = int(os.getenv("CODEX_STATUS_TTL_SECONDS", str(TIMEOUT + 60)))
 MAX_INPUT_TOKENS = int(os.getenv("MAX_INPUT_TOKENS", "2500"))
 STATUSES: dict[str, dict] = {}
 STATUS_LOCK = threading.Lock()
@@ -123,13 +124,61 @@ def set_status(session_id: str, status: str, detail: str = "") -> None:
             "updated_at": now,
         }
         STATUSES[session_id] = value
-        try:
-            STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
-            tmp = STATUS_FILE.with_suffix(".tmp")
-            tmp.write_text(json.dumps(STATUSES, ensure_ascii=False, indent=2))
-            tmp.replace(STATUS_FILE)
-        except OSError:
-            LOGGER.warning("Unable to persist Codex status file")
+        persist_statuses_locked()
+
+
+def persist_statuses_locked() -> None:
+    try:
+        STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = STATUS_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(STATUSES, ensure_ascii=False, indent=2))
+        tmp.replace(STATUS_FILE)
+    except OSError:
+        LOGGER.warning("Unable to persist Codex status file")
+
+
+def load_statuses_from_disk() -> None:
+    if not STATUS_FILE.exists():
+        return
+    try:
+        values = json.loads(STATUS_FILE.read_text())
+        if isinstance(values, dict):
+            STATUSES.update({str(key): value for key, value in values.items() if isinstance(value, dict)})
+    except (OSError, ValueError):
+        LOGGER.warning("Unable to read existing Codex status file")
+
+
+def parse_status_time(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def stale_status(item: dict) -> bool:
+    if item.get("status") not in {"working", "finalizing"}:
+        return False
+    updated_at = parse_status_time(str(item.get("updated_at", "")))
+    if not updated_at:
+        return True
+    age = datetime.now(timezone.utc) - updated_at.astimezone(timezone.utc)
+    return age.total_seconds() > STATUS_TTL_SECONDS
+
+
+def interrupt_active_statuses(reason: str) -> None:
+    changed = False
+    now = datetime.now(timezone.utc).isoformat()
+    with STATUS_LOCK:
+        for item in STATUSES.values():
+            if item.get("status") in {"working", "finalizing"}:
+                item["status"] = "interrupted"
+                item["detail"] = reason
+                item["updated_at"] = now
+                changed = True
+        if changed:
+            persist_statuses_locked()
 
 
 def load_codex_memory_context(max_tokens: int = MEMORY_CONTEXT_TOKENS) -> str:
@@ -312,6 +361,15 @@ class Handler(BaseHTTPRequestHandler):
             session_id = parse_qs(parsed.query).get("session_id", ["default"])[0]
             with STATUS_LOCK:
                 status = STATUSES.get(session_id, {"status": "queued", "detail": "等待 Codex 启动"})
+                if stale_status(status):
+                    status = {
+                        **status,
+                        "status": "interrupted",
+                        "detail": "任务状态超时，可能是 Bridge 或 Codex 进程已中断",
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                    STATUSES[session_id] = status
+                    persist_statuses_locked()
             self._json(status)
             return
         self._json({"error": "not found"}, 404)
@@ -323,6 +381,7 @@ class Handler(BaseHTTPRequestHandler):
         if not authorized(self.headers):
             self._json({"error": "unauthorized"}, 401)
             return
+        session_id = "default"
         try:
             length = int(self.headers.get("Content-Length", "0"))
             body = json.loads(self.rfile.read(length))
@@ -393,6 +452,7 @@ class Handler(BaseHTTPRequestHandler):
             LOGGER.warning("Bridge request failed: %s", exc)
             self._json({"error": str(exc)}, 502)
         except Exception:
+            set_status(session_id, "failed", "Bridge 内部错误")
             LOGGER.exception("Unexpected bridge error")
             self._json({"error": "internal bridge error"}, 500)
 
@@ -403,6 +463,8 @@ class Handler(BaseHTTPRequestHandler):
 def main() -> None:
     if not TOKEN:
         raise SystemExit("CODEX_BRIDGE_TOKEN must be configured")
+    load_statuses_from_disk()
+    interrupt_active_statuses("Bridge 已重启，上一次未完成任务已中断")
     LOGGER.info("Starting local Codex bridge on %s:%s", HOST, PORT)
     ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
 

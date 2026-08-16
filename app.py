@@ -9,11 +9,15 @@ import hashlib
 import json
 import uuid
 import requests
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import aiohttp
 import dingtalk_stream
 from dingtalk_stream import AckMessage
+
+from scheduled_jobs import build_prompt, load_jobs, update_job
 
 
 logging.basicConfig(
@@ -44,6 +48,7 @@ RUNTIME_CONFIG_PATH = Path(os.getenv("RUNTIME_CONFIG_PATH", "/app/data/runtime.j
 CODEX_CWD_PATH = Path(os.getenv("CODEX_CWD", str(Path.cwd()))).resolve()
 MEDIA_DIR = DB_PATH.parent / "dingtalk_files"
 SESSION_MAP_FILE = DB_PATH.parent / "dingtalk_sessions.json"
+SCHEDULE_FILE = DB_PATH.parent / "scheduled_jobs.json"
 MAX_MEDIA_BYTES = 50 * 1024 * 1024
 
 
@@ -55,6 +60,144 @@ def runtime_config() -> dict:
     except (OSError, ValueError):
         LOGGER.exception("Failed to read runtime config")
         return {}
+
+
+def truthy(value: object) -> bool:
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def scheduled_jobs_enabled() -> bool:
+    if truthy(os.getenv("DINGTALK_ENABLE_SCHEDULED_JOBS", "")):
+        return True
+    return bool(runtime_config().get("dingtalk_scheduled_jobs", False))
+
+
+def save_target(source_id: str, message: dingtalk_stream.ChatbotMessage) -> None:
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""CREATE TABLE IF NOT EXISTS dingtalk_targets (
+        source_id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, conversation_type TEXT NOT NULL,
+        user_id TEXT NOT NULL, robot_code TEXT NOT NULL, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )""")
+    conn.execute("""INSERT INTO dingtalk_targets(source_id, conversation_id, conversation_type, user_id, robot_code, updated_at)
+        VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(source_id) DO UPDATE SET conversation_id=excluded.conversation_id,
+        conversation_type=excluded.conversation_type, user_id=excluded.user_id,
+        robot_code=excluded.robot_code, updated_at=CURRENT_TIMESTAMP""", (
+            source_id,
+            str(message.conversation_id or ""),
+            str(message.conversation_type or ""),
+            str(message.sender_staff_id or message.sender_id or ""),
+            str(message.robot_code or ""),
+        ))
+    conn.commit()
+    conn.close()
+
+
+def load_target(source_id: str) -> dict:
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""CREATE TABLE IF NOT EXISTS dingtalk_targets (
+        source_id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, conversation_type TEXT NOT NULL,
+        user_id TEXT NOT NULL, robot_code TEXT NOT NULL, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )""")
+    row = conn.execute("SELECT conversation_id, conversation_type, user_id, robot_code FROM dingtalk_targets WHERE source_id=?", (source_id,)).fetchone()
+    conn.close()
+    if not row:
+        return {}
+    return dict(zip(("conversation_id", "conversation_type", "user_id", "robot_code"), row))
+
+
+def send_proactive_text(client: dingtalk_stream.DingTalkStreamClient, robot_code: str, target: dict, text: str) -> None:
+    access_token = client.get_access_token()
+    if not access_token:
+        raise RuntimeError("无法获取钉钉 access token")
+    headers = {
+        "Content-Type": "application/json",
+        "x-acs-dingtalk-access-token": access_token,
+    }
+    message = {"msgKey": "sampleText", "msgParam": json.dumps({"content": text}, ensure_ascii=False)}
+    conversation_type = str(target.get("conversation_type", ""))
+    if conversation_type in {"2", "group"}:
+        conversation_id = str(target.get("conversation_id", ""))
+        if not conversation_id:
+            raise ValueError("任务缺少钉钉群会话 ID")
+        url = "https://api.dingtalk.com/v1.0/robot/groupMessages/send"
+        payload = {**message, "robotCode": robot_code, "openConversationId": conversation_id}
+    else:
+        user_id = str(target.get("user_id", ""))
+        if not user_id:
+            raise ValueError("任务缺少钉钉用户 ID")
+        url = "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend"
+        payload = {**message, "robotCode": robot_code, "userIds": [user_id]}
+    response = requests.post(url, headers=headers, json=payload, timeout=30)
+    if response.status_code == 401:
+        client.reset_access_token()
+    if response.status_code >= 400:
+        try:
+            detail = response.json()
+        except ValueError:
+            detail = response.text
+        raise RuntimeError(f"钉钉主动发送失败 ({response.status_code}): {detail}")
+
+
+async def run_scheduled_jobs(client: dingtalk_stream.DingTalkStreamClient, default_robot_code: str) -> None:
+    while True:
+        try:
+            if not scheduled_jobs_enabled():
+                await asyncio.sleep(30)
+                continue
+            jobs = load_jobs(SCHEDULE_FILE)
+            for job in jobs:
+                if str(job.get("channel", "")).strip().lower() != "dingtalk":
+                    continue
+                if not job.get("enabled", True):
+                    continue
+                try:
+                    job_id = str(job.get("id", ""))
+                    if not job_id:
+                        raise ValueError("定时任务缺少 ID")
+                    zone = ZoneInfo(str(job.get("timezone", "Asia/Shanghai")))
+                    now = datetime.now(zone)
+                    today = now.date().isoformat()
+                    start_date = str(job.get("start_date", today))
+                    hour, minute = (int(part) for part in str(job.get("time", "08:00")).split(":", 1))
+                    if today < start_date or (now.hour, now.minute) < (hour, minute):
+                        continue
+                    if job.get("last_sent_date") == today:
+                        continue
+                    source_id = str(job.get("session_id", "")).removeprefix("dingtalk:")
+                    if not source_id:
+                        raise ValueError("任务缺少钉钉会话 ID")
+                    target = load_target(source_id)
+                    target = {**job, **target}
+                    robot_code = str(target.get("robot_code") or default_robot_code)
+                    if not robot_code:
+                        raise ValueError("任务缺少钉钉机器人编码")
+                    session_id = active_session_id("dingtalk", source_id)
+                    update_job(SCHEDULE_FILE, job_id, {
+                        "last_status": "running",
+                        "last_run_at": now.isoformat(),
+                    }, remove=("last_error",))
+                    LOGGER.info("Running DingTalk scheduled job %s for %s", job_id, session_id)
+                    answer = await ask_backend(session_id, build_prompt(job, today), "dingtalk", str(target.get("user_id", "")), record_prompt=False)
+                    await asyncio.to_thread(send_proactive_text, client, robot_code, target, answer[:18000])
+                    update_job(SCHEDULE_FILE, job_id, {
+                        "last_sent_date": today,
+                        "last_sent_at": now.isoformat(),
+                        "last_status": "success",
+                    }, remove=("last_error",))
+                    LOGGER.info("Sent DingTalk scheduled job %s", job_id)
+                except Exception as exc:
+                    update_job(SCHEDULE_FILE, str(job.get("id", "")), {
+                        "last_status": "failed",
+                        "last_error": str(exc)[:500],
+                        "last_run_at": datetime.now(ZoneInfo("UTC")).isoformat(),
+                    })
+                    LOGGER.exception("DingTalk scheduled job %s failed; will retry", job.get("id"))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOGGER.exception("DingTalk scheduled job processing failed; will retry")
+        await asyncio.sleep(30)
 
 
 def ensure_sessions_table() -> None:
@@ -178,7 +321,7 @@ async def run_with_progress(coro, notify) -> str:
             task.cancel()
 
 
-async def ask_openai(session_id: str, prompt: str, platform: str = "dingtalk") -> str:
+async def ask_openai(session_id: str, prompt: str, platform: str = "dingtalk", record_prompt: bool = True) -> str:
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY is not configured")
     history = await STORE.history(session_id)
@@ -193,12 +336,13 @@ async def ask_openai(session_id: str, prompt: str, platform: str = "dingtalk") -
                 message = body.get("error", {}).get("message", str(body)) if isinstance(body, dict) else str(body)
                 raise RuntimeError(f"AI request failed ({response.status}): {message}")
     answer = body["choices"][0]["message"]["content"].strip()
-    await STORE.append(session_id, "user", prompt, platform)
+    if record_prompt:
+        await STORE.append(session_id, "user", prompt, platform)
     await STORE.append(session_id, "assistant", answer, platform)
     return answer
 
 
-async def ask_backend(session_id: str, prompt: str, platform: str = "dingtalk", actor_id: str = "") -> str:
+async def ask_backend(session_id: str, prompt: str, platform: str = "dingtalk", actor_id: str = "", record_prompt: bool = True) -> str:
     if AI_BACKEND == "codex":
         if not CODEX_BRIDGE_TOKEN:
             raise RuntimeError("CODEX_BRIDGE_TOKEN is not configured")
@@ -216,10 +360,11 @@ async def ask_backend(session_id: str, prompt: str, platform: str = "dingtalk", 
         answer = str(body.get("answer", "")).strip()
         if not answer:
             raise RuntimeError("本地 Codex 没有返回内容")
-        await STORE.append(session_id, "user", prompt, platform)
+        if record_prompt:
+            await STORE.append(session_id, "user", prompt, platform)
         await STORE.append(session_id, "assistant", answer, platform)
         return answer
-    return await ask_openai(session_id, prompt, platform)
+    return await ask_openai(session_id, prompt, platform, record_prompt)
 
 
 class WorkBotHandler(dingtalk_stream.ChatbotHandler):
@@ -268,6 +413,16 @@ class WorkBotHandler(dingtalk_stream.ChatbotHandler):
         message = dingtalk_stream.ChatbotMessage.from_dict(callback.data)
         sender_id = str(getattr(message, "sender_staff_id", "") or getattr(message, "sender_id", ""))
         source_id = str(getattr(message, "conversation_id", "") or sender_id)
+        message_adapter_enabled = runtime_config().get("channel", "dingtalk") == "dingtalk"
+        if ALLOWED_USERS and sender_id not in ALLOWED_USERS:
+            LOGGER.warning("Rejected sender: %s", sender_id)
+            if message_adapter_enabled:
+                self.reply_text("当前账号未被授权使用此机器人。", message)
+            return AckMessage.STATUS_OK, "IGNORED"
+        save_target(source_id, message)
+        if not message_adapter_enabled:
+            LOGGER.info("Cached DingTalk route while message adapter is disabled")
+            return AckMessage.STATUS_OK, "IGNORED"
         session_id = active_session_id("dingtalk", source_id)
         message_type = str(raw.get("msgtype") or getattr(message, "message_type", "") or "")
         raw_content = raw.get("content") if isinstance(raw.get("content"), dict) else {}
@@ -315,11 +470,6 @@ class WorkBotHandler(dingtalk_stream.ChatbotHandler):
                     return AckMessage.STATUS_OK, "OK"
         elif message_type in {"picture", "image", "file", "document", "video"} and not text:
             self.reply_text("已收到媒体消息，但钉钉未提供可用下载码。", message)
-            return AckMessage.STATUS_OK, "OK"
-
-        if ALLOWED_USERS and sender_id not in ALLOWED_USERS:
-            LOGGER.warning("Rejected sender: %s", sender_id)
-            self.reply_text("当前账号未被授权使用此机器人。", message)
             return AckMessage.STATUS_OK, "OK"
 
         if text.lower() in {"/new", "/newsession"} or text in {"新开会话", "开始新会话", "新建会话"}:
@@ -378,13 +528,26 @@ class WorkBotHandler(dingtalk_stream.ChatbotHandler):
         return AckMessage.STATUS_OK, "OK"
 
 
+async def run_adapter(client: dingtalk_stream.DingTalkStreamClient, robot_code: str) -> None:
+    scheduler = asyncio.create_task(run_scheduled_jobs(client, robot_code))
+    LOGGER.info("DingTalk scheduled job worker started (%s)", "enabled" if scheduled_jobs_enabled() else "disabled")
+    try:
+        await client.start()
+    finally:
+        scheduler.cancel()
+        await asyncio.gather(scheduler, return_exceptions=True)
+
+
 def main() -> None:
     config = runtime_config()
     channel = config.get("channel", "dingtalk")
-    if channel != "dingtalk":
-        LOGGER.info("DingTalk adapter disabled; selected channel is %s", channel)
-        asyncio.run(asyncio.Event().wait())
-        return
+    if channel != "dingtalk" and not scheduled_jobs_enabled():
+        LOGGER.info("DingTalk adapter disabled; waiting for channel selection or scheduler enablement")
+        async def wait_until_enabled() -> None:
+            while runtime_config().get("channel", "dingtalk") != "dingtalk" and not scheduled_jobs_enabled():
+                await asyncio.sleep(3)
+        asyncio.run(wait_until_enabled())
+        config = runtime_config()
     if AI_BACKEND != "codex" and not OPENAI_API_KEY:
         LOGGER.warning("OPENAI_API_KEY is not configured; DingTalk connectivity will start, but AI replies are disabled")
     dingtalk = config.get("dingtalk", {})
@@ -392,12 +555,16 @@ def main() -> None:
     client_secret = dingtalk.get("client_secret") or os.environ["DINGTALK_CLIENT_SECRET"]
     credential = dingtalk_stream.Credential(client_id, client_secret)
     client = dingtalk_stream.DingTalkStreamClient(credential, logger=LOGGER)
+    handler = WorkBotHandler()
     client.register_callback_handler(
         dingtalk_stream.chatbot.ChatbotMessage.TOPIC,
-        WorkBotHandler(),
+        handler,
     )
     LOGGER.info("Starting DingTalk Stream bot with backend %s", AI_BACKEND)
-    client.start_forever()
+    try:
+        asyncio.run(run_adapter(client, client_id))
+    except KeyboardInterrupt:
+        LOGGER.info("DingTalk adapter stopped")
 
 
 if __name__ == "__main__":
