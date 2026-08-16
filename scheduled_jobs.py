@@ -54,6 +54,34 @@ def update_job(path: Path, job_id: str, values: dict, remove: tuple[str, ...] = 
     return found
 
 
+def claim_job(path: Path, job_id: str, *, trigger: str, run_at: str, today: str) -> dict | None:
+    claimed: dict | None = None
+
+    def claim(jobs: list[dict]) -> None:
+        nonlocal claimed
+        for job in jobs:
+            if str(job.get("id", "")) != job_id:
+                continue
+            if trigger == "manual":
+                if not job.get("run_requested_at"):
+                    return
+            else:
+                if job.get("run_requested_at") or not job.get("enabled", True) or job.get("last_sent_date") == today:
+                    return
+            job.pop("run_requested_at", None)
+            job.pop("last_error", None)
+            job.update({
+                "last_status": "running",
+                "last_run_at": run_at,
+                "last_trigger": trigger,
+            })
+            claimed = dict(job)
+            return
+
+    mutate_jobs(path, claim)
+    return claimed
+
+
 def build_prompt(job: dict, today: str) -> str:
     custom = str(job.get("prompt", "")).strip()
     if custom:

@@ -17,7 +17,7 @@ import aiohttp
 import dingtalk_stream
 from dingtalk_stream import AckMessage
 
-from scheduled_jobs import build_prompt, load_jobs, update_job
+from scheduled_jobs import build_prompt, claim_job, load_jobs, update_job
 
 
 logging.basicConfig(
@@ -149,7 +149,8 @@ async def run_scheduled_jobs(client: dingtalk_stream.DingTalkStreamClient, defau
             for job in jobs:
                 if str(job.get("channel", "")).strip().lower() != "dingtalk":
                     continue
-                if not job.get("enabled", True):
+                manual = bool(job.get("run_requested_at"))
+                if not manual and not job.get("enabled", True):
                     continue
                 try:
                     job_id = str(job.get("id", ""))
@@ -158,12 +159,18 @@ async def run_scheduled_jobs(client: dingtalk_stream.DingTalkStreamClient, defau
                     zone = ZoneInfo(str(job.get("timezone", "Asia/Shanghai")))
                     now = datetime.now(zone)
                     today = now.date().isoformat()
-                    start_date = str(job.get("start_date", today))
-                    hour, minute = (int(part) for part in str(job.get("time", "08:00")).split(":", 1))
-                    if today < start_date or (now.hour, now.minute) < (hour, minute):
+                    if not manual:
+                        start_date = str(job.get("start_date", today))
+                        hour, minute = (int(part) for part in str(job.get("time", "08:00")).split(":", 1))
+                        if today < start_date or (now.hour, now.minute) < (hour, minute):
+                            continue
+                        if job.get("last_sent_date") == today:
+                            continue
+                    trigger = "manual" if manual else "scheduled"
+                    claimed = claim_job(SCHEDULE_FILE, job_id, trigger=trigger, run_at=now.isoformat(), today=today)
+                    if not claimed:
                         continue
-                    if job.get("last_sent_date") == today:
-                        continue
+                    job = claimed
                     source_id = str(job.get("session_id", "")).removeprefix("dingtalk:")
                     if not source_id:
                         raise ValueError("任务缺少钉钉会话 ID")
@@ -173,11 +180,7 @@ async def run_scheduled_jobs(client: dingtalk_stream.DingTalkStreamClient, defau
                     if not robot_code:
                         raise ValueError("任务缺少钉钉机器人编码")
                     session_id = active_session_id("dingtalk", source_id)
-                    update_job(SCHEDULE_FILE, job_id, {
-                        "last_status": "running",
-                        "last_run_at": now.isoformat(),
-                    }, remove=("last_error",))
-                    LOGGER.info("Running DingTalk scheduled job %s for %s", job_id, session_id)
+                    LOGGER.info("Running DingTalk %s job %s for %s", trigger, job_id, session_id)
                     answer = await ask_backend(session_id, build_prompt(job, today), "dingtalk", str(target.get("user_id", "")), record_prompt=False)
                     await asyncio.to_thread(send_proactive_text, client, robot_code, target, answer[:18000])
                     update_job(SCHEDULE_FILE, job_id, {

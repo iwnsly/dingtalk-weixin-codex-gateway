@@ -80,6 +80,12 @@ def scheduled_job_content(job: dict) -> str:
     return types.get(str(job.get("type", "")), "未配置执行内容")
 
 
+def scheduled_executor_enabled(config: dict, channel: str) -> bool:
+    env_name = "WEIXIN_ENABLE_SCHEDULED_JOBS" if channel == "wechat" else "DINGTALK_ENABLE_SCHEDULED_JOBS"
+    env_enabled = str(os.getenv(env_name, "")).strip().lower() in {"1", "true", "yes", "on"}
+    return env_enabled or bool(config.get(f"{channel}_scheduled_jobs", False))
+
+
 def parse_status_time(value: str) -> datetime | None:
     if not value:
         return None
@@ -130,7 +136,7 @@ def logged_in(handler: BaseHTTPRequestHandler) -> bool:
 
 def page(title: str, body: str) -> str:
     return f"""<!doctype html><html lang=zh-CN><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>{title}</title>
-<style>:root{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#172033;background:#f4f7fb}}*{{box-sizing:border-box}}body{{margin:0}}.shell{{max-width:1180px;margin:0 auto;padding:32px 22px}}.top{{display:flex;justify-content:space-between;align-items:center;margin-bottom:24px}}.brand{{font-size:22px;font-weight:750}}.muted{{color:#667085}}.panel{{background:#fff;border:1px solid #e4e9f0;border-radius:14px;padding:22px;box-shadow:0 8px 28px #12233d0a;margin-bottom:18px}}.grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}}label{{display:block;font-size:13px;font-weight:650;margin-bottom:7px;color:#344054}}input,select{{width:100%;border:1px solid #d0d5dd;border-radius:8px;padding:10px 11px;font:inherit;background:#fff}}button{{border:0;border-radius:8px;background:#1664d9;color:white;padding:10px 16px;font:inherit;font-weight:650;cursor:pointer}}button.secondary{{background:#eef4ff;color:#1555ad}}button.danger{{background:#fff0f0;color:#b42318}}.tabs{{display:flex;gap:8px;margin-bottom:16px}}.tab{{padding:9px 13px;border-radius:8px;text-decoration:none;color:#475467;background:#f2f4f7}}.tab.active{{background:#1664d9;color:#fff}}table{{width:100%;border-collapse:collapse;font-size:13px}}.schedule-table{{min-width:960px}}th,td{{text-align:left;padding:12px 9px;border-bottom:1px solid #eef1f5;vertical-align:top}}th{{color:#667085;font-size:12px}}td.content{{white-space:pre-wrap;max-width:680px;word-break:break-word}}.badge{{display:inline-block;padding:4px 8px;border-radius:999px;font-size:12px;font-weight:650}}.wechat{{background:#e7f8ef;color:#16804b}}.dingtalk{{background:#e8f1ff;color:#1555ad}}.enabled{{background:#e7f8ef;color:#16804b}}.disabled{{background:#f2f4f7;color:#667085}}.actions{{display:flex;gap:6px;align-items:center}}.actions form{{margin:0}}.login{{max-width:390px;margin:12vh auto}}img.qr{{width:220px;border-radius:10px;border:1px solid #e4e9f0}}@media(max-width:760px){{.grid{{grid-template-columns:1fr}}.shell{{padding:20px 14px}}table{{font-size:12px}}}}
+<style>:root{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#172033;background:#f4f7fb}}*{{box-sizing:border-box}}body{{margin:0}}.shell{{max-width:1180px;margin:0 auto;padding:32px 22px}}.top{{display:flex;justify-content:space-between;align-items:center;margin-bottom:24px}}.brand{{font-size:22px;font-weight:750}}.muted{{color:#667085}}.panel{{background:#fff;border:1px solid #e4e9f0;border-radius:14px;padding:22px;box-shadow:0 8px 28px #12233d0a;margin-bottom:18px}}.grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}}label{{display:block;font-size:13px;font-weight:650;margin-bottom:7px;color:#344054}}input,select{{width:100%;border:1px solid #d0d5dd;border-radius:8px;padding:10px 11px;font:inherit;background:#fff}}button{{border:0;border-radius:8px;background:#1664d9;color:white;padding:10px 16px;font:inherit;font-weight:650;cursor:pointer}}button.secondary{{background:#eef4ff;color:#1555ad}}button.danger{{background:#fff0f0;color:#b42318}}button:disabled{{cursor:not-allowed;opacity:.5}}.tabs{{display:flex;gap:8px;margin-bottom:16px}}.tab{{padding:9px 13px;border-radius:8px;text-decoration:none;color:#475467;background:#f2f4f7}}.tab.active{{background:#1664d9;color:#fff}}table{{width:100%;border-collapse:collapse;font-size:13px}}.schedule-table{{min-width:1040px}}th,td{{text-align:left;padding:12px 9px;border-bottom:1px solid #eef1f5;vertical-align:top}}th{{color:#667085;font-size:12px}}td.content{{white-space:pre-wrap;max-width:680px;word-break:break-word}}.badge{{display:inline-block;padding:4px 8px;border-radius:999px;font-size:12px;font-weight:650}}.wechat{{background:#e7f8ef;color:#16804b}}.dingtalk{{background:#e8f1ff;color:#1555ad}}.enabled{{background:#e7f8ef;color:#16804b}}.disabled{{background:#f2f4f7;color:#667085}}.actions{{display:flex;gap:6px;align-items:center;flex-wrap:wrap}}.actions form{{margin:0}}.login{{max-width:390px;margin:12vh auto}}img.qr{{width:220px;border-radius:10px;border:1px solid #e4e9f0}}@media(max-width:760px){{.grid{{grid-template-columns:1fr}}.shell{{padding:20px 14px}}table{{font-size:12px}}}}
 </style><style>.task-dot{{display:inline-block;width:9px;height:9px;border-radius:50%;background:#98a2b3;margin-right:7px}}.task-dot.active{{background:#f5a623;box-shadow:0 0 0 4px #fff3d6}}.filter-label{{font-size:12px;font-weight:700;color:#667085;margin:4px 0 8px}}.selection{{display:inline-block;padding:4px 8px;border-radius:6px;background:#e8f1ff;color:#1555ad;font-size:12px;font-weight:700}}</style><div class=shell>{body}</div></html>"""
 
 
@@ -207,12 +213,16 @@ def dashboard(c: dict, view: str, channel: str, start: str, end: str, session_id
             enabled = bool(job.get("enabled", True))
             job_id = str(job.get("id", ""))
             schedule = f"{job.get('time', '--:--')} · {job.get('timezone', 'Asia/Shanghai')}"
-            status_labels = {"running": "执行中", "success": "执行成功", "failed": "执行失败"}
+            status_labels = {"queued": "等待执行", "running": "执行中", "success": "执行成功", "failed": "执行失败"}
             last_status = str(job.get("last_status", ""))
             last_result = str(job.get("last_error") or status_labels.get(last_status) or ("执行成功" if job.get("last_sent_at") else "尚未执行"))
-            last_time = str(job.get("last_sent_at") or job.get("last_run_at") or "-").replace("T", " ")[:19]
+            last_time = str(job.get("run_requested_at") or job.get("last_sent_at") or job.get("last_run_at") or "-").replace("T", " ")[:19]
             toggle_label = "停用" if enabled else "启用"
-            schedule_rows.append(f"<tr><td><div style='font-weight:700'>{html.escape(str(job.get('name') or job_id or '未命名任务'))}</div><div class=muted style='font-size:11px;margin-top:4px'>{html.escape(job_id)}</div></td><td><span class='badge {job_channel}'>{'微信' if job_channel == 'wechat' else '钉钉'}</span></td><td><span class='badge {'enabled' if enabled else 'disabled'}'>{'已启用' if enabled else '已停用'}</span></td><td>{html.escape(schedule)}</td><td class=content>{html.escape(scheduled_job_content(job))}</td><td><div>{html.escape(last_result)}</div><div class=muted style='font-size:11px;margin-top:4px'>{html.escape(last_time)}</div></td><td><div class=actions><form method=post action=/schedule/toggle><input type=hidden name=job_id value='{html.escape(job_id, quote=True)}'><button class=secondary>{toggle_label}</button></form><form method=post action=/schedule/delete onsubmit=\"return confirm('确定删除这个定时任务吗？')\"><input type=hidden name=job_id value='{html.escape(job_id, quote=True)}'><button class=danger>删除</button></form></div></td></tr>")
+            executor_enabled = scheduled_executor_enabled(c, job_channel)
+            run_disabled = last_status in {"queued", "running"} or not executor_enabled
+            run_label = "等待中" if last_status == "queued" else ("执行中" if last_status == "running" else "立即执行")
+            run_title = "任务正在等待或执行" if last_status in {"queued", "running"} else ("请先启用对应渠道的定时任务执行器" if not executor_enabled else "立即执行一次")
+            schedule_rows.append(f"<tr><td><div style='font-weight:700'>{html.escape(str(job.get('name') or job_id or '未命名任务'))}</div><div class=muted style='font-size:11px;margin-top:4px'>{html.escape(job_id)}</div></td><td><span class='badge {job_channel}'>{'微信' if job_channel == 'wechat' else '钉钉'}</span></td><td><span class='badge {'enabled' if enabled else 'disabled'}'>{'已启用' if enabled else '已停用'}</span></td><td>{html.escape(schedule)}</td><td class=content>{html.escape(scheduled_job_content(job))}</td><td><div>{html.escape(last_result)}</div><div class=muted style='font-size:11px;margin-top:4px'>{html.escape(last_time)}</div></td><td><div class=actions><form method=post action=/schedule/run><input type=hidden name=job_id value='{html.escape(job_id, quote=True)}'><input type=hidden name=channel value='{schedule_channel}'><button title='{html.escape(run_title, quote=True)}' {'disabled' if run_disabled else ''}>{run_label}</button></form><form method=post action=/schedule/toggle><input type=hidden name=job_id value='{html.escape(job_id, quote=True)}'><button class=secondary>{toggle_label}</button></form><form method=post action=/schedule/delete onsubmit=\"return confirm('确定删除这个定时任务吗？')\"><input type=hidden name=job_id value='{html.escape(job_id, quote=True)}'><button class=danger>删除</button></form></div></td></tr>")
         schedule_table = "".join(schedule_rows) or "<tr><td colspan=7 class=muted>当前渠道暂无定时任务</td></tr>"
         body += f"<div class=panel><div class=top><div><h2 style='margin:0 0 6px'>定时任务</h2><div class=muted>统一查看各渠道任务的计划、执行内容和最近结果</div></div><span class=selection>{len(jobs)} 个任务</span></div><div class=filter-label>渠道筛选</div><div class=tabs><a class='tab {'active' if schedule_channel == 'all' else ''}' href='/?view=schedules&channel=all'>全部</a><a class='tab {'active' if schedule_channel == 'wechat' else ''}' href='/?view=schedules&channel=wechat'>微信</a><a class='tab {'active' if schedule_channel == 'dingtalk' else ''}' href='/?view=schedules&channel=dingtalk'>钉钉</a></div><form method=post action=/schedule-executors style='margin:18px 0'><div class=grid><label style='display:flex;gap:10px;align-items:center'><input type=checkbox name=wechat_scheduled_jobs value=1 {'checked' if c.get('wechat_scheduled_jobs', False) else ''} style='width:auto'>启用微信定时任务执行器</label><label style='display:flex;gap:10px;align-items:center'><input type=checkbox name=dingtalk_scheduled_jobs value=1 {'checked' if c.get('dingtalk_scheduled_jobs', False) else ''} style='width:auto'>启用钉钉定时任务执行器</label></div><p class=muted>钉钉启用后，需要目标用户或群聊至少向机器人发送过一条消息，以保存主动发送路由。</p><button class=secondary>保存执行器状态</button></form><div style='overflow:auto'><table class=schedule-table><thead><tr><th>任务</th><th>渠道</th><th>状态</th><th>执行计划</th><th>执行内容</th><th>最近执行</th><th>操作</th></tr></thead><tbody>{schedule_table}</tbody></table></div></div>"
     else:
@@ -299,6 +309,24 @@ class Handler(BaseHTTPRequestHandler):
                 old["dingtalk_scheduled_jobs"] = data.get("dingtalk_scheduled_jobs", [""])[0] == "1"
             save_config(old)
             self.respond("", 303, {"Location":"/?view=schedules"}); return
+        if path == "/schedule/run":
+            job_id = data.get("job_id", [""])[0]
+            config = load_config()
+            def request_run(jobs):
+                for job in jobs:
+                    if str(job.get("id", "")) != job_id:
+                        continue
+                    channel = scheduled_job_channel(job)
+                    if not scheduled_executor_enabled(config, channel) or job.get("last_status") in {"queued", "running"}:
+                        return
+                    job["run_requested_at"] = datetime.now(timezone.utc).isoformat()
+                    job["last_status"] = "queued"
+                    job.pop("last_error", None)
+                    return
+            mutate_jobs(SCHEDULE_FILE, request_run)
+            schedule_channel = data.get("channel", ["all"])[0]
+            if schedule_channel not in {"all", "wechat", "dingtalk"}: schedule_channel = "all"
+            self.respond("", 303, {"Location":f"/?view=schedules&channel={schedule_channel}"}); return
         if path in {"/schedule/toggle", "/schedule/delete"}:
             job_id = data.get("job_id", [""])[0]
             if path == "/schedule/delete":

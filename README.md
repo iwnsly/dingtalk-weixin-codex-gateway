@@ -16,17 +16,7 @@
 - **本地 Codex**：宿主机运行受控 Bridge，调用 Codex CLI；Bridge 默认使用只读沙箱。
 - **控制台**：配置入口、查看微信登录状态、修改管理密码和审计聊天记录。
 
-两个 IM 入口共享同一个 Codex Bridge，但运行时只启用一个渠道，避免重复消费和会话混乱。
-
-本项目与同级目录的 `../remodex` 是两个独立项目：本网关面向微信/钉钉基础入口，Remodex 面向手机控制 Codex Desktop。两者不要共用 Git 根目录，也不要把 Remodex 的私有 Desktop IPC 当作本项目的稳定接口。
-
-网关项目目录：
-
-```text
-/Users/macbot/Documents/remote/dingtalk-weixin-codex-gateway
-```
-
-在网关目录内执行 Docker、Python 和 Git 命令；`../remodex` 保持独立开发、测试和提交。
+两个 IM 入口共享同一个 Codex Bridge。普通消息只由“当前渠道”接收；微信和钉钉定时执行器可独立启停。
 
 ## 任务进度通知
 
@@ -96,6 +86,21 @@ Compose 容器通过 `host.docker.internal` 访问宿主机，因此 Bridge 不�
 
 服务启动后可用 `curl http://127.0.0.1:8787/health` 验证。
 
+### macOS 登录自动启动
+
+项目提供 Docker Desktop 启动脚本和 LaunchAgent 模板。安装后，登录 macOS 会自动打开 Docker Desktop，等待 `desktop-linux` 引擎就绪，并执行 `docker compose up -d`；之后每分钟检查一次，可在 Docker Desktop 意外退出后恢复网关。
+
+```bash
+chmod +x scripts/start-docker-desktop-gateway.sh
+sed "s|__PROJECT_DIR__|$(pwd)|g" \
+  deploy/macos/com.iwnsly.dingtalk-weixin-codex-gateway.docker.plist \
+  > ~/Library/LaunchAgents/com.iwnsly.dingtalk-weixin-codex-gateway.docker.plist
+launchctl bootstrap gui/$(id -u) \
+  ~/Library/LaunchAgents/com.iwnsly.dingtalk-weixin-codex-gateway.docker.plist
+```
+
+请在项目根目录执行上述命令，模板中的 `__PROJECT_DIR__` 会替换为当前绝对路径。Docker 容器使用 `restart: unless-stopped`，Codex Bridge 则由独立的 `com.iwnsly.dingtalk-weixin-codex-gateway.bridge` LaunchAgent 常驻。启动日志位于 `/tmp/dingtalk-weixin-codex-gateway-docker.log` 和对应的 `.err` 文件。
+
 默认 Bridge 使用 Codex 只读沙箱。登录管理控制台后，在“配置”页的“Codex 权限”中可以打开“完全权限”。
 
 | 模式 | 能力 | 建议 |
@@ -125,9 +130,9 @@ data/weixin_token.json
 
 微信和钉钉定时主动推送默认关闭。需要启用时，在控制台“定时任务”页分别勾选对应渠道的执行器，或设置环境变量 `WEIXIN_ENABLE_SCHEDULED_JOBS=1`、`DINGTALK_ENABLE_SCHEDULED_JOBS=1`。后台开关保存后最多 30 秒生效，不需要重启容器。
 
-“定时任务”页统一列出微信和钉钉任务，可按渠道筛选，并查看启用状态、执行计划、执行内容、最近结果和执行时间，也可直接启停或删除任务。没有 `channel` 字段的旧任务会根据 `session_id` 自动归类，继续兼容。
+“定时任务”页统一列出微信和钉钉任务，可按渠道筛选，并查看启用状态、执行计划、执行内容、最近结果和执行时间，也可直接手工执行、启停或删除任务。手工执行会绕过任务自身的启停状态和计划时间，但对应渠道的执行器必须开启；请求入队后，执行器会在下一次轮询时领取，最长等待约 30 秒。没有 `channel` 字段的旧任务会根据 `session_id` 自动归类，继续兼容。
 
-两个渠道共用 `data/scheduled_jobs.json`，支持按指定时区和时间主动发送每日内容。执行器会写入 `last_status`、`last_run_at`、`last_error` 和 `last_sent_at`，后台可直接查看最近执行结果。任务发送成功后会保存 `last_sent_date`，服务重启不会在同一天重复发送；生成或发送失败时每 30 秒重试。两个容器通过文件锁按任务更新状态，避免同时执行时互相覆盖。
+两个渠道共用 `data/scheduled_jobs.json`，支持按指定时区和时间主动发送每日内容。执行器会写入 `last_status`、`last_run_at`、`last_trigger`、`last_error` 和 `last_sent_at`，后台可直接查看最近执行结果。手工请求使用 `queued` 状态并由执行器原子领取；手工或计划任务发送成功后都会保存 `last_sent_date`，服务重启不会在同一天重复发送。计划任务生成或发送失败时每 30 秒重试，失败的手工任务不会自动重复。两个容器通过文件锁按任务更新状态，避免同时执行时互相覆盖。
 
 当前任务类型 `daily_fortune` 会通过本地 Codex Bridge 生成当日运势；也可在任务中设置 `prompt`，其中 `{date}` 会替换为执行日期。钉钉使用官方机器人主动发送接口，支持单聊和群聊。目标用户或群聊需要至少先向机器人发送一条消息，网关会将主动发送所需的用户、会话和机器人标识保存在 SQLite 中。
 
@@ -314,7 +319,7 @@ environment:
 ## 开发检查
 
 ```bash
-python3 -m py_compile app.py admin.py bridge.py weixin.py
+python3 -m py_compile app.py admin.py bridge.py weixin.py scheduled_jobs.py
 docker compose config
 docker compose build
 ```
@@ -324,10 +329,11 @@ docker compose build
 本目录是独立 Git 仓库，远程仓库为 `iwnsly/dingtalk-weixin-codex-gateway`。常用流程：
 
 ```bash
-cd /Users/macbot/Documents/remote/dingtalk-weixin-codex-gateway
+git clone https://github.com/iwnsly/dingtalk-weixin-codex-gateway.git
+cd dingtalk-weixin-codex-gateway
 git status
-git add README.md app.py weixin.py bridge.py admin.py docker-compose.yml
-git commit -m "docs: clarify gateway project layout and channel capabilities"
+git add -A
+git commit -m "feat: describe your change"
 git push origin main
 ```
 

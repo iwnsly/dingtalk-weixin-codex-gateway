@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 import aiohttp
 import sqlite3
 
-from scheduled_jobs import build_prompt, load_jobs, update_job
+from scheduled_jobs import build_prompt, claim_job, load_jobs, update_job
 
 BASE = os.getenv('WEIXIN_BASE_URL', 'https://ilinkai.weixin.qq.com').rstrip('/')
 DATA = Path(os.getenv('DB_PATH', '/app/data/bot.db')).parent
@@ -127,7 +127,8 @@ async def run_scheduled_jobs(client):
                 channel = str(job.get('channel', '')).strip().lower()
                 if channel and channel != 'wechat':
                     continue
-                if not job.get('enabled', True):
+                manual = bool(job.get('run_requested_at'))
+                if not manual and not job.get('enabled', True):
                     continue
                 try:
                     job_id = str(job.get('id', ''))
@@ -136,21 +137,23 @@ async def run_scheduled_jobs(client):
                     timezone = ZoneInfo(job.get('timezone', 'Asia/Shanghai'))
                     now = datetime.now(timezone)
                     today = now.date().isoformat()
-                    start_date = job.get('start_date', today)
-                    hour, minute = (int(part) for part in job.get('time', '08:00').split(':', 1))
-                    if today < start_date or (now.hour, now.minute) < (hour, minute):
+                    if not manual:
+                        start_date = job.get('start_date', today)
+                        hour, minute = (int(part) for part in job.get('time', '08:00').split(':', 1))
+                        if today < start_date or (now.hour, now.minute) < (hour, minute):
+                            continue
+                        if job.get('last_sent_date') == today:
+                            continue
+                    trigger = 'manual' if manual else 'scheduled'
+                    claimed = claim_job(SCHEDULE_FILE, job_id, trigger=trigger, run_at=now.isoformat(), today=today)
+                    if not claimed:
                         continue
-                    if job.get('last_sent_date') == today:
-                        continue
+                    job = claimed
                     source_id = job.get('session_id', '').removeprefix('wechat:')
                     if not source_id:
                         raise ValueError('任务缺少微信会话 ID')
                     session_id = active_session_id(source_id)
-                    update_job(SCHEDULE_FILE, job_id, {
-                        'last_status': 'running',
-                        'last_run_at': now.isoformat(),
-                    }, remove=('last_error',))
-                    LOG.info('Running scheduled job %s for %s', job.get('id'), session_id)
+                    LOG.info('Running %s job %s for %s', trigger, job.get('id'), session_id)
                     body = await request_codex(session_id, build_prompt(job, today))
                     answer = body.get('answer') or ''
                     if not answer:
